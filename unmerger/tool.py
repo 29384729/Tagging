@@ -543,6 +543,7 @@ class TrainCfgReco:
     huber_delta: float = 1.0
     w_reco: float = 1.0
     w_k: float = 0.2  # optionally supervise k on parent token during reco
+    freeze_encoder: bool = True  # freeze encoder + parent/k heads during Stage2
 
 
 def _cosine_schedule(ep: int, warmup: int, total: int) -> float:
@@ -708,13 +709,36 @@ def train_reco_teacher_forced(
     *,
     ckpt_path: Optional[str | Path] = None,
 ) -> dict[str, Any]:
-    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
+    # Optionally freeze encoder + parent/k heads to avoid representation drift.
+    # Important: put frozen modules in eval() so BatchNorm/Dropout stats do not change.
+    orig_flags = [(p, bool(p.requires_grad)) for p in model.parameters()]
+
+    def _set_requires_grad(mod: nn.Module, flag: bool) -> None:
+        for p in mod.parameters():
+            p.requires_grad = bool(flag)
+
+    frozen_mods: list[nn.Module] = []
+    if bool(getattr(cfg, "freeze_encoder", True)):
+        for name in ["input_proj", "encoder", "parent_head", "k_head"]:
+            if hasattr(model, name):
+                mod = getattr(model, name)
+                if isinstance(mod, nn.Module):
+                    _set_requires_grad(mod, False)
+                    frozen_mods.append(mod)
+
+    # Build optimizer over trainable params only (decoder side).
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if len(trainable_params) == 0:
+        raise RuntimeError("No trainable parameters found for reco training (check freeze settings).")
+    opt = torch.optim.AdamW(trainable_params, lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
     best = float("inf")
     best_state = None
     no_imp = 0
     hist: dict[str, list[float]] = {"train": [], "val": []}
     for ep in range(1, int(cfg.epochs) + 1):
         model.train()
+        for fm in frozen_mods:
+            fm.eval()
         lr_scale = _cosine_schedule(ep - 1, int(cfg.warmup_epochs), int(cfg.epochs))
         for g in opt.param_groups:
             g["lr"] = float(cfg.lr) * float(lr_scale)
@@ -744,7 +768,7 @@ def train_reco_teacher_forced(
                 loss = loss + float(cfg.w_k) * loss_k
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.grad_clip))
+            torch.nn.utils.clip_grad_norm_(trainable_params, float(cfg.grad_clip))
             opt.step()
             running += float(loss.item())
             n += 1
@@ -767,6 +791,9 @@ def train_reco_teacher_forced(
             break
     if best_state is not None:
         model.load_state_dict(best_state)
+    # Restore original requires_grad flags for safety (so later stages can fine-tune if desired).
+    for p, f in orig_flags:
+        p.requires_grad = bool(f)
     return {"best": best, "history": hist}
 
 
