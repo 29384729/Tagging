@@ -6,7 +6,7 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Local experiment outputs
-runs/
+runs*/
 
 # OS/editor
 .DS_Store
