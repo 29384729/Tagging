@@ -137,13 +137,75 @@ def raw_to_feats_with_axis(const: np.ndarray, mask: np.ndarray, jet_eta: np.ndar
     return feats.astype(np.float32)
 
 
-def feats_to_raw(feats: np.ndarray, jet_eta: np.ndarray, jet_phi: np.ndarray) -> np.ndarray:
-    """Inverse of raw_to_feats_with_axis for 4D features."""
+def raw_to_feats7_with_axis(
+    const: np.ndarray,
+    mask: np.ndarray,
+    jet_eta: np.ndarray,
+    jet_phi: np.ndarray,
+    jet_pt: np.ndarray,
+    jet_E: np.ndarray,
+) -> np.ndarray:
+    """Compute 7 engineered features in jet-axis frame (mirrors Baseline.compute_features)."""
     eps = 1e-8
-    log_pt = feats[..., 0]
-    dEta = feats[..., 1]
-    dPhi = feats[..., 2]
-    log_E = feats[..., 3]
+    pt = np.maximum(const[:, :, 0], eps)
+    eta = np.clip(const[:, :, 1], -5, 5)
+    phi = const[:, :, 2]
+    E = np.maximum(const[:, :, 3], eps)
+
+    dEta = np.clip(eta - jet_eta[:, None], -5.0, 5.0)
+    dPhi = wrap_dphi(phi - jet_phi[:, None])
+    log_pt = np.log(pt + eps)
+    log_E = np.log(E + eps)
+    log_pt_over_jetpt = np.log(pt / np.maximum(jet_pt[:, None], eps) + eps)
+    log_E_over_jetE = np.log(E / np.maximum(jet_E[:, None], eps) + eps)
+    dR = np.sqrt(dEta**2 + dPhi**2)
+    feats = np.stack(
+        [dEta, dPhi, log_pt, log_E, log_pt_over_jetpt, log_E_over_jetE, dR],
+        axis=-1,
+    )
+    feats = np.clip(np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0), -20.0, 20.0)
+    feats[~mask] = 0.0
+    return feats.astype(np.float32)
+
+
+def raw_to_feats(
+    const: np.ndarray,
+    mask: np.ndarray,
+    hlt_axis: np.ndarray,
+    *,
+    kind: str = "4d",
+) -> np.ndarray:
+    """Feature front-end switch: kind in {"4d","7d"}."""
+    jet_eta = hlt_axis[:, 0]
+    jet_phi = hlt_axis[:, 1]
+    jet_pt = hlt_axis[:, 2]
+    jet_E = hlt_axis[:, 3]
+    k = str(kind).lower()
+    if k in ("4", "4d", "raw4", "logpt_detadphi_loge"):
+        return raw_to_feats_with_axis(const, mask, jet_eta, jet_phi)
+    if k in ("7", "7d", "eng7", "engineered7"):
+        return raw_to_feats7_with_axis(const, mask, jet_eta, jet_phi, jet_pt, jet_E)
+    raise ValueError(f"Unknown feature kind: {kind}")
+
+
+def feats_to_raw(feats: np.ndarray, jet_eta: np.ndarray, jet_phi: np.ndarray) -> np.ndarray:
+    """Map features back to raw (pt,eta,phi,E). Supports 4D and the Baseline-style 7D engineered features."""
+    eps = 1e-8
+    D = int(feats.shape[-1])
+    if D == 4:
+        # (log_pt, dEta, dPhi, log_E)
+        log_pt = feats[..., 0]
+        dEta = feats[..., 1]
+        dPhi = feats[..., 2]
+        log_E = feats[..., 3]
+    elif D >= 7:
+        # Baseline 7D order: (dEta, dPhi, log_pt, log_E, log(pt/jet_pt), log(E/jet_E), dR)
+        dEta = feats[..., 0]
+        dPhi = feats[..., 1]
+        log_pt = feats[..., 2]
+        log_E = feats[..., 3]
+    else:
+        raise ValueError(f"Unsupported feature dim for feats_to_raw: {D}")
 
     pt = np.maximum(np.exp(log_pt), eps)
     eta = np.clip(jet_eta[..., None] + dEta, -5, 5)
@@ -444,7 +506,8 @@ class ParentRecoDataset(Dataset):
         jet_idx, parent_idx = self.samples[sidx]
         ch = self.children[sidx]
         m = int(ch.shape[0])
-        tgt = torch.zeros((self.k_max, 4), dtype=torch.float32)
+        D = int(self.off_child_feat_std.shape[-1])
+        tgt = torch.zeros((self.k_max, D), dtype=torch.float32)
         tgt_mask = torch.zeros((self.k_max,), dtype=torch.bool)
         tgt[:m] = self.off_child_feat_std[jet_idx, ch]
         tgt_mask[:m] = True
@@ -1111,7 +1174,7 @@ def build_unmerged_view_ordered(
                 mP = mj.repeat(P, 1)
                 pidx = torch.tensor(parents, dtype=torch.long, device=device)
                 outP = model(xP, mP, parent_idx=pidx)
-                child = outP.child_feat.detach().cpu().numpy()  # [P,K,4] in standardized feat space
+                child = outP.child_feat.detach().cpu().numpy()  # [P,K,D] in standardized feat space
                 # k_pred is expectation if k_mode='class', regression otherwise
                 k_pred_tok = outP.k_pred.detach().cpu().numpy()  # [P,S]
                 k_logits_tok = outP.k_logits.detach().cpu().numpy() if outP.k_logits is not None else None  # [P,S,K]
@@ -1132,7 +1195,7 @@ def build_unmerged_view_ordered(
                     k_child = max(0, min(int(k_child), child.shape[1]))
                     if k_child <= 0:
                         continue
-                    feats = child[pi, :k_child]  # [k,4] (std)
+                    feats = child[pi, :k_child]  # [k,D] (std)
                     feats = feats * feat_stds[None, :] + feat_means[None, :]  # unstandardize
                     je = np.asarray([hlt_axis[j, 0]], dtype=np.float32)
                     jp = np.asarray([hlt_axis[j, 1]], dtype=np.float32)
@@ -1144,10 +1207,10 @@ def build_unmerged_view_ordered(
             out_raw[j] = packed
             out_mask[j] = pmask
 
-    # Build standardized features in the same 4D space for downstream (optional)
-    jet_eta = hlt_axis[:, 0]
-    jet_phi = hlt_axis[:, 1]
-    feats = raw_to_feats_with_axis(out_raw, out_mask, jet_eta, jet_phi)
+    # Build standardized features in the same feature space for downstream (optional)
+    D = int(np.asarray(feat_means).shape[0])
+    kind = "7d" if D >= 7 else "4d"
+    feats = raw_to_feats(out_raw, out_mask, hlt_axis, kind=kind)
     feats_std = standardize_tokens(feats, out_mask, feat_means, feat_stds, clip=10.0)
     return out_raw, out_mask, feats_std
 
