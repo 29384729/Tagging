@@ -499,6 +499,29 @@ def _masked_weighted_huber(
     return (loss * w_v).sum() / (w_v.sum() + 1e-8)
 
 
+def _masked_weighted_ce(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    w: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Weighted token-level cross-entropy.
+    Args:
+      logits: [B,S,K]
+      target: [B,S] long in [0, K-1]
+      mask: [B,S] bool
+      w: [B,S] float weights (e.g. 1 for parents, neg_k_weight for non-parents)
+    """
+    if int(mask.sum().item()) == 0:
+        return logits.new_tensor(0.0)
+    lv = logits[mask]
+    tv = target[mask]
+    wv = torch.clamp(w[mask], min=0.0)
+    ce = F.cross_entropy(lv, tv, reduction="none")  # [M]
+    return (ce * wv).sum() / (wv.sum() + 1e-8)
+
+
 @dataclass
 class TrainCfgPK:
     epochs: int = 30
@@ -586,7 +609,12 @@ def eval_parent_k(model, loader, device: torch.device, *, pos_weight: float, cfg
         parent_loss = _masked_bce_with_logits(out.parent_logit, y_parent, m, pos_weight=float(pos_weight))
         tot_parent += float(parent_loss.item())
         w = torch.where(y_parent > 0.5, torch.ones_like(y_parent), y_parent.new_full(y_parent.shape, float(cfg.neg_k_weight)))
-        k_loss = _masked_weighted_huber(out.k_pred, y_k, m, w, delta=float(cfg.huber_delta))
+        if out.k_logits is not None:
+            K = int(out.k_logits.shape[-1])
+            y_ki = torch.clamp(y_k.round().to(torch.long), 0, K - 1)
+            k_loss = _masked_weighted_ce(out.k_logits, y_ki, m, w)
+        else:
+            k_loss = _masked_weighted_huber(out.k_pred, y_k, m, w, delta=float(cfg.huber_delta))
         tot_k += float(k_loss.item())
         sum_loss = _parent_sum_huber(out.k_pred, y_k, y_parent, m, delta=float(cfg.huber_delta))
         tot_sum += float(sum_loss.item())
@@ -624,13 +652,24 @@ def train_parent_k(
     best = float("inf")
     best_state = None
     no_imp = 0
-    hist: dict[str, list[float]] = {"train": [], "val_parent": [], "val_k": [], "val_sum": []}
+    hist: dict[str, list[float]] = {
+        "train_total": [],
+        "train_parent": [],
+        "train_k": [],
+        "train_sum": [],
+        "val_parent": [],
+        "val_k": [],
+        "val_sum": [],
+    }
     for ep in range(1, int(cfg.epochs) + 1):
         model.train()
         lr_scale = _cosine_schedule(ep - 1, int(cfg.warmup_epochs), int(cfg.epochs))
         for g in opt.param_groups:
             g["lr"] = float(cfg.lr) * float(lr_scale)
-        running = 0.0
+        running_total = 0.0
+        running_parent = 0.0
+        running_k = 0.0
+        running_sum = 0.0
         n = 0
         for batch in train_loader:
             x = batch["hlt"].to(device)
@@ -641,13 +680,21 @@ def train_parent_k(
             out = model(x, m, parent_idx=None)
             parent_loss = _masked_bce_with_logits(out.parent_logit, y_parent, m, pos_weight=float(pos_weight)) #加权BCE loss作为parent_loss
             w = torch.where(y_parent > 0.5, torch.ones_like(y_parent), y_parent.new_full(y_parent.shape, float(cfg.neg_k_weight)))
-            k_loss = _masked_weighted_huber(out.k_pred, y_k, m, w, delta=float(cfg.huber_delta)) #加权Huber loss作为k_loss，注意neg_k_weight为0.2表示负样本的权重不如正样本重要，言下之意，我们并不关心不是parent的k值
+            if out.k_logits is not None:
+                K = int(out.k_logits.shape[-1])
+                y_ki = torch.clamp(y_k.round().to(torch.long), 0, K - 1)
+                k_loss = _masked_weighted_ce(out.k_logits, y_ki, m, w)
+            else:
+                k_loss = _masked_weighted_huber(out.k_pred, y_k, m, w, delta=float(cfg.huber_delta)) #加权Huber loss作为k_loss，注意neg_k_weight为0.2表示负样本的权重不如正样本重要，言下之意，我们并不关心不是parent的k值
             sum_loss = _parent_sum_huber(out.k_pred, y_k, y_parent, m, delta=float(cfg.huber_delta))
             loss = float(cfg.w_parent) * parent_loss + float(cfg.w_k) * k_loss + float(cfg.w_sum) * sum_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.grad_clip))
             opt.step()
-            running += float(loss.item())
+            running_total += float(loss.item())
+            running_parent += float(parent_loss.item())
+            running_k += float(k_loss.item())
+            running_sum += float(sum_loss.item())
             n += 1
         val = eval_parent_k(model, val_loader, device, pos_weight=float(pos_weight), cfg=cfg)
         val_scalar = float(val["parent_loss"] + val["k_loss"] + float(cfg.w_sum) * val.get("sum_loss", 0.0))
@@ -659,13 +706,17 @@ def train_parent_k(
                 save_checkpoint(model, ckpt_path, extra={"epoch": ep, "best": best, "val": val})
         else:
             no_imp += 1
-        hist["train"].append(float(running / max(1, n)))
+        hist["train_total"].append(float(running_total / max(1, n)))
+        hist["train_parent"].append(float(running_parent / max(1, n)))
+        hist["train_k"].append(float(running_k / max(1, n)))
+        hist["train_sum"].append(float(running_sum / max(1, n)))
         hist["val_parent"].append(float(val["parent_loss"]))
         hist["val_k"].append(float(val["k_loss"]))
         hist["val_sum"].append(float(val.get("sum_loss", 0.0)))
         print(
-            f"[Parent+K] Ep {ep:03d}: train={hist['train'][-1]:.4f} val_parent={val['parent_loss']:.4f} "
-            f"val_k={val['k_loss']:.4f} val_sum={val.get('sum_loss', 0.0):.4f} "
+            f"[Parent+K] Ep {ep:03d}: train_total={hist['train_total'][-1]:.4f} "
+            f"(p={hist['train_parent'][-1]:.4f}, k={hist['train_k'][-1]:.4f}, sum={hist['train_sum'][-1]:.4f}) "
+            f"val_p={val['parent_loss']:.4f} val_k={val['k_loss']:.4f} val_sum={val.get('sum_loss', 0.0):.4f} "
             f"prec={val['precision']:.3f} rec={val['recall']:.3f} no_imp={no_imp}"
         )
         if no_imp >= int(cfg.patience):
@@ -680,6 +731,11 @@ def train_parent_k(
 def eval_reco(model, loader, device: torch.device, *, cfg: TrainCfgReco) -> dict[str, float]:
     model.eval()
     tot = 0.0
+    tot_reco = 0.0
+    tot_k_token = 0.0
+    tot_parent_aux = 0.0
+    tot_k_aux = 0.0
+    tot_sum_aux = 0.0
     nb = 0
     mae_m = 0.0
     for batch in loader:
@@ -697,14 +753,48 @@ def eval_reco(model, loader, device: torch.device, *, cfg: TrainCfgReco) -> dict
         denom = w_mask.sum().clamp_min(1.0)
         loss_reco = loss_reco / denom
         loss = float(cfg.w_reco) * loss_reco
+        tot_reco += float(loss_reco.item())
 
         # Optional k supervision on parent token (if present)
         if "k_true_token" in batch:
             k_true_token = batch["k_true_token"].to(device)
             bi = torch.arange(int(x.shape[0]), device=device)
-            k_pred_token = out.k_pred[bi, parent_idx]
-            loss_k = F.smooth_l1_loss(k_pred_token, k_true_token, reduction="mean", beta=float(cfg.huber_delta))
-            loss = loss + float(cfg.w_k) * loss_k
+            if out.k_logits is not None:
+                logits_tok = out.k_logits[bi, parent_idx]  # [B,K]
+                K = int(logits_tok.shape[-1])
+                y_ki = torch.clamp(k_true_token.round().to(torch.long), 0, K - 1)
+                loss_k = F.cross_entropy(logits_tok, y_ki, reduction="mean")
+                loss = loss + float(cfg.w_k) * loss_k
+            else:
+                k_pred_token = out.k_pred[bi, parent_idx]
+                loss_k = F.smooth_l1_loss(k_pred_token, k_true_token, reduction="mean", beta=float(cfg.huber_delta))
+                loss = loss + float(cfg.w_k) * loss_k
+            tot_k_token += float(loss_k.item())
+
+        # Optional auxiliary losses (if batch provides full jet targets)
+        if float(getattr(cfg, "w_parent_aux", 0.0)) > 0.0 and ("parent_gt" in batch):
+            y_parent = batch["parent_gt"].to(device)
+            loss_parent_aux = _masked_bce_with_logits(out.parent_logit, y_parent, m, pos_weight=1.0)
+            loss = loss + float(cfg.w_parent_aux) * loss_parent_aux
+            tot_parent_aux += float(loss_parent_aux.item())
+        if float(getattr(cfg, "w_k_aux", 0.0)) > 0.0 and ("k_true" in batch) and ("parent_gt" in batch):
+            y_parent = batch["parent_gt"].to(device)
+            y_k = batch["k_true"].to(device)
+            w = torch.where(y_parent > 0.5, torch.ones_like(y_parent), y_parent.new_full(y_parent.shape, float(cfg.neg_k_weight)))
+            if out.k_logits is not None:
+                K = int(out.k_logits.shape[-1])
+                y_ki = torch.clamp(y_k.round().to(torch.long), 0, K - 1)
+                loss_k_aux = _masked_weighted_ce(out.k_logits, y_ki, m, w)
+            else:
+                loss_k_aux = _masked_weighted_huber(out.k_pred, y_k, m, w, delta=float(cfg.huber_delta))
+            loss = loss + float(cfg.w_k_aux) * loss_k_aux
+            tot_k_aux += float(loss_k_aux.item())
+        if float(getattr(cfg, "w_sum_aux", 0.0)) > 0.0 and ("k_true" in batch) and ("parent_gt" in batch):
+            y_parent = batch["parent_gt"].to(device)
+            y_k = batch["k_true"].to(device)
+            loss_sum_aux = _parent_sum_huber(out.k_pred, y_k, y_parent, m, delta=float(cfg.huber_delta))
+            loss = loss + float(cfg.w_sum_aux) * loss_sum_aux
+            tot_sum_aux += float(loss_sum_aux.item())
 
         tot += float(loss.item())
         nb += 1
@@ -712,8 +802,18 @@ def eval_reco(model, loader, device: torch.device, *, cfg: TrainCfgReco) -> dict
         # k as proxy: compare round(k_pred_token) to m_true
         if "k_true_token" in batch:
             m_true = batch["m_true"].to(device)
+            if out.k_logits is not None:
+                k_pred_token = out.k_pred[bi, parent_idx]
             mae_m += float((k_pred_token - m_true).abs().mean().item())
-    return {"loss": tot / max(1, nb), "mae_k_vs_m": mae_m / max(1, nb) if nb > 0 else float("nan")}
+    return {
+        "loss": tot / max(1, nb),
+        "loss_reco": tot_reco / max(1, nb),
+        "loss_k_token": tot_k_token / max(1, nb),
+        "loss_parent_aux": tot_parent_aux / max(1, nb),
+        "loss_k_aux": tot_k_aux / max(1, nb),
+        "loss_sum_aux": tot_sum_aux / max(1, nb),
+        "mae_k_vs_m": mae_m / max(1, nb) if nb > 0 else float("nan"),
+    }
 
 
 def train_reco_teacher_forced(
@@ -790,7 +890,20 @@ def train_reco_teacher_forced(
     best = float("inf")
     best_state = None
     no_imp = 0
-    hist: dict[str, list[float]] = {"train": [], "val": []}
+    hist: dict[str, list[float]] = {
+        "train_total": [],
+        "train_reco": [],
+        "train_k_token": [],
+        "train_parent_aux": [],
+        "train_k_aux": [],
+        "train_sum_aux": [],
+        "val_total": [],
+        "val_reco": [],
+        "val_k_token": [],
+        "val_parent_aux": [],
+        "val_k_aux": [],
+        "val_sum_aux": [],
+    }
     for ep in range(1, int(cfg.epochs) + 1):
         model.train()
         for fm in frozen_mods:
@@ -798,7 +911,12 @@ def train_reco_teacher_forced(
         lr_scale = _cosine_schedule(ep - 1, int(cfg.warmup_epochs), int(cfg.epochs))
         for g in opt.param_groups:
             g["lr"] = float(g.get("base_lr", float(cfg.lr))) * float(lr_scale)
-        running = 0.0
+        running_total = 0.0
+        running_reco = 0.0
+        running_k_token = 0.0
+        running_parent_aux = 0.0
+        running_k_aux = 0.0
+        running_sum_aux = 0.0
         n = 0
         for batch in train_loader:
             x = batch["hlt"].to(device)
@@ -815,36 +933,53 @@ def train_reco_teacher_forced(
             denom = w_mask.sum().clamp_min(1.0)
             loss_reco = loss_reco / denom
             loss = float(cfg.w_reco) * loss_reco
+            running_reco += float(loss_reco.item())
 
             if "k_true_token" in batch:
                 k_true_token = batch["k_true_token"].to(device)
                 bi = torch.arange(int(x.shape[0]), device=device)
-                k_pred_token = out.k_pred[bi, parent_idx]
-                loss_k = F.smooth_l1_loss(k_pred_token, k_true_token, reduction="mean", beta=float(cfg.huber_delta))
-                loss = loss + float(cfg.w_k) * loss_k
+                if out.k_logits is not None:
+                    logits_tok = out.k_logits[bi, parent_idx]  # [B,K]
+                    K = int(logits_tok.shape[-1])
+                    y_ki = torch.clamp(k_true_token.round().to(torch.long), 0, K - 1)
+                    loss_k = F.cross_entropy(logits_tok, y_ki, reduction="mean")
+                    loss = loss + float(cfg.w_k) * loss_k
+                else:
+                    k_pred_token = out.k_pred[bi, parent_idx]
+                    loss_k = F.smooth_l1_loss(k_pred_token, k_true_token, reduction="mean", beta=float(cfg.huber_delta))
+                    loss = loss + float(cfg.w_k) * loss_k
+                running_k_token += float(loss_k.item())
 
             # Optional auxiliary losses to prevent parent/k drift during Stage2
             if float(getattr(cfg, "w_parent_aux", 0.0)) > 0.0 and ("parent_gt" in batch):
                 y_parent = batch["parent_gt"].to(device)
                 loss_parent_aux = _masked_bce_with_logits(out.parent_logit, y_parent, m, pos_weight=float(pos_weight))
                 loss = loss + float(cfg.w_parent_aux) * loss_parent_aux
+                running_parent_aux += float(loss_parent_aux.item())
             if float(getattr(cfg, "w_k_aux", 0.0)) > 0.0 and ("k_true" in batch) and ("parent_gt" in batch):
                 y_parent = batch["parent_gt"].to(device)
                 y_k = batch["k_true"].to(device)
                 w = torch.where(y_parent > 0.5, torch.ones_like(y_parent), y_parent.new_full(y_parent.shape, float(cfg.neg_k_weight)))
-                loss_k_aux = _masked_weighted_huber(out.k_pred, y_k, m, w, delta=float(cfg.huber_delta))
+                if out.k_logits is not None:
+                    K = int(out.k_logits.shape[-1])
+                    y_ki = torch.clamp(y_k.round().to(torch.long), 0, K - 1)
+                    loss_k_aux = _masked_weighted_ce(out.k_logits, y_ki, m, w)
+                else:
+                    loss_k_aux = _masked_weighted_huber(out.k_pred, y_k, m, w, delta=float(cfg.huber_delta))
                 loss = loss + float(cfg.w_k_aux) * loss_k_aux
+                running_k_aux += float(loss_k_aux.item())
             if float(getattr(cfg, "w_sum_aux", 0.0)) > 0.0 and ("k_true" in batch) and ("parent_gt" in batch):
                 y_parent = batch["parent_gt"].to(device)
                 y_k = batch["k_true"].to(device)
                 loss_sum_aux = _parent_sum_huber(out.k_pred, y_k, y_parent, m, delta=float(cfg.huber_delta))
                 loss = loss + float(cfg.w_sum_aux) * loss_sum_aux
+                running_sum_aux += float(loss_sum_aux.item())
 
             loss.backward()
             trainable = [p for p in model.parameters() if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(trainable, float(cfg.grad_clip))
             opt.step()
-            running += float(loss.item())
+            running_total += float(loss.item())
             n += 1
 
         val = eval_reco(model, val_loader, device, cfg=cfg)
@@ -857,9 +992,28 @@ def train_reco_teacher_forced(
                 save_checkpoint(model, ckpt_path, extra={"epoch": ep, "best": best, "val": val})
         else:
             no_imp += 1
-        hist["train"].append(float(running / max(1, n)))
-        hist["val"].append(float(v))
-        print(f"[Reco/TF] Ep {ep:03d}: train={hist['train'][-1]:.4f} val={v:.4f} no_imp={no_imp}")
+        hist["train_total"].append(float(running_total / max(1, n)))
+        hist["train_reco"].append(float(running_reco / max(1, n)))
+        hist["train_k_token"].append(float(running_k_token / max(1, n)))
+        hist["train_parent_aux"].append(float(running_parent_aux / max(1, n)))
+        hist["train_k_aux"].append(float(running_k_aux / max(1, n)))
+        hist["train_sum_aux"].append(float(running_sum_aux / max(1, n)))
+
+        hist["val_total"].append(float(v))
+        hist["val_reco"].append(float(val.get("loss_reco", 0.0)))
+        hist["val_k_token"].append(float(val.get("loss_k_token", 0.0)))
+        hist["val_parent_aux"].append(float(val.get("loss_parent_aux", 0.0)))
+        hist["val_k_aux"].append(float(val.get("loss_k_aux", 0.0)))
+        hist["val_sum_aux"].append(float(val.get("loss_sum_aux", 0.0)))
+
+        print(
+            f"[Reco/TF] Ep {ep:03d}: train_total={hist['train_total'][-1]:.4f} "
+            f"(reco={hist['train_reco'][-1]:.4f}, k_tok={hist['train_k_token'][-1]:.4f}, "
+            f"p_aux={hist['train_parent_aux'][-1]:.4f}, k_aux={hist['train_k_aux'][-1]:.4f}, sum_aux={hist['train_sum_aux'][-1]:.4f}) "
+            f"val_total={v:.4f} val_reco={hist['val_reco'][-1]:.4f} val_k_tok={hist['val_k_token'][-1]:.4f} "
+            f"val_p_aux={hist['val_parent_aux'][-1]:.4f} val_k_aux={hist['val_k_aux'][-1]:.4f} val_sum_aux={hist['val_sum_aux'][-1]:.4f} "
+            f"no_imp={no_imp}"
+        )
         if no_imp >= int(cfg.patience):
             print("[Reco/TF] Early stopping.")
             break
@@ -908,6 +1062,7 @@ def build_unmerged_view_ordered(
     max_split_parents: Optional[int] = 20,
     max_k_per_parent: Optional[int] = 8,
     count_kind: str = "missing",
+    k_infer_mode: str = "expectation",  # "expectation" | "argmax" (only used when k_mode='class')
     batch_size: int = 256,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -957,9 +1112,17 @@ def build_unmerged_view_ordered(
                 pidx = torch.tensor(parents, dtype=torch.long, device=device)
                 outP = model(xP, mP, parent_idx=pidx)
                 child = outP.child_feat.detach().cpu().numpy()  # [P,K,4] in standardized feat space
+                # k_pred is expectation if k_mode='class', regression otherwise
                 k_pred_tok = outP.k_pred.detach().cpu().numpy()  # [P,S]
+                k_logits_tok = outP.k_logits.detach().cpu().numpy() if outP.k_logits is not None else None  # [P,S,K]
                 for pi in range(P):
-                    k_val = float(k_pred_tok[pi, int(parents[pi])])
+                    # 这里决定推理用哪种 k：
+                    # - expectation: 用 E[k]（可当作连续值，再 round）
+                    # - argmax: 用 argmax(P(k=j)) 得到离散 k
+                    if k_logits_tok is not None and str(k_infer_mode).lower() == "argmax":
+                        k_val = int(np.argmax(k_logits_tok[pi, int(parents[pi])], axis=-1))
+                    else:
+                        k_val = float(k_pred_tok[pi, int(parents[pi])])
                     if str(count_kind).lower() in ("missing", "delta", "deltan"):
                         k_child = int(max(1, int(np.round(k_val)) + 1))
                     else:

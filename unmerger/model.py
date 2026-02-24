@@ -27,6 +27,7 @@ import torch.nn.functional as F
 class UnmergerOutputs:
     parent_logit: torch.Tensor  # [B,S]
     k_pred: torch.Tensor  # [B,S]
+    k_logits: Optional[torch.Tensor] = None  # [B,S,K] if k_mode="class"
     child_feat: Optional[torch.Tensor] = None  # [B,K,4] if parent_idx provided
 
 
@@ -44,6 +45,11 @@ class OrderedUnmerger(nn.Module):
         ff_dim: int = 512,
         dropout: float = 0.1,
         k_max: int = 8,
+        # k head modes:
+        # - "reg": scalar regression (softplus) with optional gating by parentness
+        # - "class": categorical distribution over k in {0..k_bins-1} (k_pred is expectation)
+        k_mode: str = "reg",
+        k_bins: int = 8,
         k_softplus_beta: float = 0.2,
         init_k_bias: Optional[float] = None,
         child_dim: int = 4,  # (log_pt, dEta, dPhi, log_E) in jet frame
@@ -53,6 +59,8 @@ class OrderedUnmerger(nn.Module):
         self.embed_dim = int(embed_dim)
         self.k_max = int(k_max)
         self.child_dim = int(child_dim)
+        self.k_mode = str(k_mode).lower()
+        self.k_bins = int(k_bins)
         self.k_softplus_beta = float(k_softplus_beta)
 
         self.input_proj = nn.Sequential(
@@ -75,13 +83,22 @@ class OrderedUnmerger(nn.Module):
 
         # Token-level heads
         self.parent_head = nn.Linear(self.embed_dim, 1)
-        self.k_head = nn.Sequential(
-            nn.Linear(self.embed_dim, 128),
-            nn.BatchNorm1d(128),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(128, 1),
-        )
+        if self.k_mode == "class":
+            self.k_head = nn.Sequential(
+                nn.Linear(self.embed_dim, 128),
+                nn.BatchNorm1d(128),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(128, int(self.k_bins)),
+            )
+        else:
+            self.k_head = nn.Sequential(
+                nn.Linear(self.embed_dim, 128),
+                nn.BatchNorm1d(128),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(128, 1),
+            )
 
         # Reconstruction decoder: fixed K queries conditioned on parent+global embeddings
         self.query_embed = nn.Parameter(torch.randn(self.k_max, self.embed_dim) * 0.02)
@@ -103,7 +120,7 @@ class OrderedUnmerger(nn.Module):
         self.child_head = nn.Linear(self.embed_dim, self.child_dim)
 
         self._init_weights()
-        if init_k_bias is not None:
+        if init_k_bias is not None and self.k_mode != "class":
             b = float(max(float(init_k_bias), 1e-6))
             inv = math.log(math.expm1(self.k_softplus_beta * b)) / self.k_softplus_beta
             last = self.k_head[-1]
@@ -145,13 +162,20 @@ class OrderedUnmerger(nn.Module):
         parent_logit = self.parent_head(memory).squeeze(-1)  # [B,S]
 
         k_in = memory.reshape(B * S, self.embed_dim)
-        k_raw = self.k_head(k_in).reshape(B, S)  # [B,S]
-        k_pos = F.softplus(k_raw, beta=self.k_softplus_beta)
-        # Gate count with parentness probability to keep non-parents near 0.
-        k_pred = torch.sigmoid(parent_logit) * k_pos
+        if self.k_mode == "class":
+            k_logits = self.k_head(k_in).reshape(B, S, int(self.k_bins))  # [B,S,K]
+            k_prob = F.softmax(k_logits, dim=-1)
+            k_vals = torch.arange(int(self.k_bins), device=k_prob.device, dtype=k_prob.dtype).view(1, 1, -1)
+            k_pred = (k_prob * k_vals).sum(dim=-1)  # [B,S] expectation
+        else:
+            k_raw = self.k_head(k_in).reshape(B, S)  # [B,S]
+            k_pos = F.softplus(k_raw, beta=self.k_softplus_beta)
+            # Gate count with parentness probability to keep non-parents near 0.
+            k_pred = torch.sigmoid(parent_logit) * k_pos
+            k_logits = None
 
         if parent_idx is None:
-            return UnmergerOutputs(parent_logit=parent_logit, k_pred=k_pred, child_feat=None)
+            return UnmergerOutputs(parent_logit=parent_logit, k_pred=k_pred, k_logits=k_logits, child_feat=None)
 
         # Conditional decoding for child features
         bi = torch.arange(B, device=memory.device)
@@ -166,7 +190,7 @@ class OrderedUnmerger(nn.Module):
         dec = self.decoder(tgt=q, memory=memory, memory_key_padding_mask=~mask)  # [B,K,E]
         child_feat = self.child_head(dec)  # [B,K,child_dim]
 
-        return UnmergerOutputs(parent_logit=parent_logit, k_pred=k_pred, child_feat=child_feat)
+        return UnmergerOutputs(parent_logit=parent_logit, k_pred=k_pred, k_logits=k_logits, child_feat=child_feat)
 
 
 # -----------------------------
