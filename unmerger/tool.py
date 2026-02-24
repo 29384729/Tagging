@@ -421,6 +421,9 @@ class ParentRecoDataset(Dataset):
         k_max: int,
         # Optionally supervise k on this parent token
         k_true_token: Optional[np.ndarray] = None,
+        # Optionally add full token-level supervision for auxiliary losses in Stage2
+        parent_gt: Optional[np.ndarray] = None,
+        k_true: Optional[np.ndarray] = None,
     ):
         self.sel = np.asarray(indices, dtype=np.int64)
         self.samples = samples
@@ -430,6 +433,8 @@ class ParentRecoDataset(Dataset):
         self.off_child_feat_std = torch.tensor(off_child_feat_std, dtype=torch.float32)
         self.k_max = int(k_max)
         self.k_true_token = None if k_true_token is None else torch.tensor(k_true_token, dtype=torch.float32)
+        self.parent_gt = None if parent_gt is None else torch.tensor(parent_gt, dtype=torch.float32)
+        self.k_true = None if k_true is None else torch.tensor(k_true, dtype=torch.float32)
 
     def __len__(self):
         return int(self.sel.shape[0])
@@ -454,6 +459,10 @@ class ParentRecoDataset(Dataset):
         }
         if self.k_true_token is not None:
             out["k_true_token"] = self.k_true_token[jet_idx, int(parent_idx)]
+        if self.parent_gt is not None:
+            out["parent_gt"] = self.parent_gt[jet_idx]
+        if self.k_true is not None:
+            out["k_true"] = self.k_true[jet_idx]
         return out
 
 
@@ -544,6 +553,13 @@ class TrainCfgReco:
     w_reco: float = 1.0
     w_k: float = 0.2  # optionally supervise k on parent token during reco
     freeze_encoder: bool = True  # freeze encoder + parent/k heads during Stage2
+    # If not freezing encoder, you can use a smaller LR for encoder than decoder.
+    enc_lr_mult: float = 0.1
+    # Optional auxiliary parent/k losses during reco to prevent drift (set small).
+    w_parent_aux: float = 0.0
+    w_k_aux: float = 0.0
+    w_sum_aux: float = 0.0
+    neg_k_weight: float = 0.2  # used by k auxiliary loss on non-parents
 
 
 def _cosine_schedule(ep: int, warmup: int, total: int) -> float:
@@ -707,30 +723,70 @@ def train_reco_teacher_forced(
     device: torch.device,
     cfg: TrainCfgReco,
     *,
+    pos_weight: float = 1.0,
     ckpt_path: Optional[str | Path] = None,
 ) -> dict[str, Any]:
-    # Optionally freeze encoder + parent/k heads to avoid representation drift.
-    # Important: put frozen modules in eval() so BatchNorm/Dropout stats do not change.
+    # Two options:
+    # - freeze_encoder=True: freeze encoder + parent/k heads, train decoder only
+    # - freeze_encoder=False: train full model but use low LR for encoder side and high LR for decoder side
     orig_flags = [(p, bool(p.requires_grad)) for p in model.parameters()]
 
-    def _set_requires_grad(mod: nn.Module, flag: bool) -> None:
-        for p in mod.parameters():
+    def _set_requires_grad(params: list[torch.nn.Parameter], flag: bool) -> None:
+        for p in params:
             p.requires_grad = bool(flag)
+
+    # Split params into encoder-side and decoder-side
+    enc_params: list[torch.nn.Parameter] = []
+    dec_params: list[torch.nn.Parameter] = []
+    for name in ["input_proj", "encoder", "parent_head", "k_head"]:
+        if hasattr(model, name):
+            mod = getattr(model, name)
+            if isinstance(mod, nn.Module):
+                enc_params += [p for p in mod.parameters()]
+    # Decoder-side (includes query_embed parameter)
+    if hasattr(model, "query_embed") and isinstance(getattr(model, "query_embed"), torch.nn.Parameter):
+        dec_params.append(getattr(model, "query_embed"))
+    for name in ["decoder", "cond_proj", "child_head"]:
+        if hasattr(model, name):
+            mod = getattr(model, name)
+            if isinstance(mod, nn.Module):
+                dec_params += [p for p in mod.parameters()]
+
+    # De-duplicate while preserving order
+    seen: set[int] = set()
+    enc_params_u: list[torch.nn.Parameter] = []
+    for p in enc_params:
+        if id(p) not in seen:
+            enc_params_u.append(p)
+            seen.add(id(p))
+    dec_params_u: list[torch.nn.Parameter] = []
+    for p in dec_params:
+        if id(p) not in seen:
+            dec_params_u.append(p)
+            seen.add(id(p))
 
     frozen_mods: list[nn.Module] = []
     if bool(getattr(cfg, "freeze_encoder", True)):
+        _set_requires_grad(enc_params_u, False)
         for name in ["input_proj", "encoder", "parent_head", "k_head"]:
-            if hasattr(model, name):
-                mod = getattr(model, name)
-                if isinstance(mod, nn.Module):
-                    _set_requires_grad(mod, False)
-                    frozen_mods.append(mod)
+            if hasattr(model, name) and isinstance(getattr(model, name), nn.Module):
+                frozen_mods.append(getattr(model, name))
+        _set_requires_grad(dec_params_u, True)
+        param_groups = [
+            {"params": [p for p in dec_params_u if p.requires_grad], "base_lr": float(cfg.lr)},
+        ]
+    else:
+        _set_requires_grad(enc_params_u, True)
+        _set_requires_grad(dec_params_u, True)
+        enc_lr = float(cfg.lr) * float(getattr(cfg, "enc_lr_mult", 0.1))
+        param_groups = [
+            {"params": [p for p in enc_params_u if p.requires_grad], "base_lr": float(enc_lr)},
+            {"params": [p for p in dec_params_u if p.requires_grad], "base_lr": float(cfg.lr)},
+        ]
 
-    # Build optimizer over trainable params only (decoder side).
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    if len(trainable_params) == 0:
-        raise RuntimeError("No trainable parameters found for reco training (check freeze settings).")
-    opt = torch.optim.AdamW(trainable_params, lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
+    if sum(len(g["params"]) for g in param_groups) == 0:
+        raise RuntimeError("No trainable parameters found for reco training (check freeze/lr settings).")
+    opt = torch.optim.AdamW(param_groups, lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
     best = float("inf")
     best_state = None
     no_imp = 0
@@ -741,7 +797,7 @@ def train_reco_teacher_forced(
             fm.eval()
         lr_scale = _cosine_schedule(ep - 1, int(cfg.warmup_epochs), int(cfg.epochs))
         for g in opt.param_groups:
-            g["lr"] = float(cfg.lr) * float(lr_scale)
+            g["lr"] = float(g.get("base_lr", float(cfg.lr))) * float(lr_scale)
         running = 0.0
         n = 0
         for batch in train_loader:
@@ -767,8 +823,26 @@ def train_reco_teacher_forced(
                 loss_k = F.smooth_l1_loss(k_pred_token, k_true_token, reduction="mean", beta=float(cfg.huber_delta))
                 loss = loss + float(cfg.w_k) * loss_k
 
+            # Optional auxiliary losses to prevent parent/k drift during Stage2
+            if float(getattr(cfg, "w_parent_aux", 0.0)) > 0.0 and ("parent_gt" in batch):
+                y_parent = batch["parent_gt"].to(device)
+                loss_parent_aux = _masked_bce_with_logits(out.parent_logit, y_parent, m, pos_weight=float(pos_weight))
+                loss = loss + float(cfg.w_parent_aux) * loss_parent_aux
+            if float(getattr(cfg, "w_k_aux", 0.0)) > 0.0 and ("k_true" in batch) and ("parent_gt" in batch):
+                y_parent = batch["parent_gt"].to(device)
+                y_k = batch["k_true"].to(device)
+                w = torch.where(y_parent > 0.5, torch.ones_like(y_parent), y_parent.new_full(y_parent.shape, float(cfg.neg_k_weight)))
+                loss_k_aux = _masked_weighted_huber(out.k_pred, y_k, m, w, delta=float(cfg.huber_delta))
+                loss = loss + float(cfg.w_k_aux) * loss_k_aux
+            if float(getattr(cfg, "w_sum_aux", 0.0)) > 0.0 and ("k_true" in batch) and ("parent_gt" in batch):
+                y_parent = batch["parent_gt"].to(device)
+                y_k = batch["k_true"].to(device)
+                loss_sum_aux = _parent_sum_huber(out.k_pred, y_k, y_parent, m, delta=float(cfg.huber_delta))
+                loss = loss + float(cfg.w_sum_aux) * loss_sum_aux
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, float(cfg.grad_clip))
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(trainable, float(cfg.grad_clip))
             opt.step()
             running += float(loss.item())
             n += 1
