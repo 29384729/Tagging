@@ -46,12 +46,18 @@ class OrderedUnmerger(nn.Module):
         dropout: float = 0.1,
         k_max: int = 8,
         child_dim: int = 4,
+        # --- dR-biased attention in encoder (optional) ---
+        use_dr_attn: bool = False,
+        dr_sigma: float = 1.0,
+        dr_gamma_init: float = 1.0,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.embed_dim = int(embed_dim)
         self.k_max = int(k_max)
         self.child_dim = int(child_dim)
+        self.use_dr_attn = bool(use_dr_attn)
+        self.dr_sigma = float(dr_sigma)
 
         self.input_proj = nn.Sequential(
             nn.Linear(self.input_dim, self.embed_dim),
@@ -60,16 +66,30 @@ class OrderedUnmerger(nn.Module):
             nn.Dropout(float(dropout)),
         )
 
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim,
-            nhead=int(num_heads),
-            dim_feedforward=int(ff_dim),
-            dropout=float(dropout),
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=int(num_layers_enc))
+        # Encoder: either vanilla TransformerEncoder or dR-biased encoder
+        if not self.use_dr_attn:
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=self.embed_dim,
+                nhead=int(num_heads),
+                dim_feedforward=int(ff_dim),
+                dropout=float(dropout),
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(enc_layer, num_layers=int(num_layers_enc))
+            self.dr_gamma = None
+        else:
+            self.dr_gamma = nn.Parameter(torch.tensor(float(dr_gamma_init)))
+            self.encoder = _DRBiasedEncoder(
+                d_model=int(self.embed_dim),
+                nhead=int(num_heads),
+                dim_feedforward=int(ff_dim),
+                dropout=float(dropout),
+                activation="gelu",
+                norm_first=True,
+                num_layers=int(num_layers_enc),
+            )
 
         # Token-level parentness
         self.parent_head = nn.Linear(self.embed_dim, 1)
@@ -128,11 +148,19 @@ class OrderedUnmerger(nn.Module):
         B, S, _ = x.shape
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # 用于 dR attention 的几何坐标（来自输入特征的 dEta/dPhi）
+        coords = None
+        if bool(self.use_dr_attn):
+            coords = _extract_deta_dphi(x, int(self.input_dim))  # [B,S,2]
+
         h = x.reshape(B * S, self.input_dim)
         h = self.input_proj(h)
         h = h.reshape(B, S, self.embed_dim)
 
-        memory = self.encoder(h, src_key_padding_mask=~mask)  # [B,S,E]
+        if isinstance(self.encoder, _DRBiasedEncoder):
+            memory = self.encoder(h, mask, coords=coords, dr_sigma=float(self.dr_sigma), dr_gamma=self.dr_gamma)  # [B,S,E]
+        else:
+            memory = self.encoder(h, src_key_padding_mask=~mask)  # [B,S,E]
         memory = torch.nan_to_num(memory, nan=0.0, posinf=0.0, neginf=0.0)
 
         parent_logit = self.parent_head(memory).squeeze(-1)  # [B,S]
@@ -153,6 +181,141 @@ class OrderedUnmerger(nn.Module):
         obj_logit = self.obj_head(dec).squeeze(-1)  # [B,K]
 
         return UnmergerOutputs(parent_logit=parent_logit, child_feat=child_feat, obj_logit=obj_logit)
+
+
+def _extract_deta_dphi(x: torch.Tensor, input_dim: int) -> torch.Tensor:
+    """
+    从输入 token features 提取 (dEta, dPhi)。
+    约定：
+    - 4D: (log_pt, dEta, dPhi, log_E) => (1,2)
+    - 7D: (dEta, dPhi, log_pt, log_E, ...) => (0,1)
+    注意：这里用的是标准化后的坐标，但只用于 attention bias（相对关系），通常够用。
+    """
+    D = int(input_dim)
+    if D == 4:
+        deta = x[..., 1]
+        dphi = x[..., 2]
+    elif D >= 7:
+        deta = x[..., 0]
+        dphi = x[..., 1]
+    else:
+        raise ValueError(f"Unsupported input_dim for dR attention: {D}")
+    return torch.stack([deta, dphi], dim=-1)
+
+
+class _DRBiasedEncoderLayer(nn.Module):
+    """Encoder layer with optional dR-biased self-attention."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        activation: str,
+        norm_first: bool,
+    ):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        self.norm_first = bool(norm_first)
+        self.self_attn = nn.MultiheadAttention(self.d_model, self.nhead, dropout=float(dropout), batch_first=True)
+        self.linear1 = nn.Linear(self.d_model, int(dim_feedforward))
+        self.linear2 = nn.Linear(int(dim_feedforward), self.d_model)
+        self.dropout = nn.Dropout(float(dropout))
+        self.dropout1 = nn.Dropout(float(dropout))
+        self.dropout2 = nn.Dropout(float(dropout))
+        self.norm1 = nn.LayerNorm(self.d_model)
+        self.norm2 = nn.LayerNorm(self.d_model)
+        self.act = nn.GELU() if str(activation).lower() == "gelu" else nn.ReLU()
+
+    def _sa(self, x: torch.Tensor, *, key_padding_mask: torch.Tensor, attn_mask: Optional[torch.Tensor]):
+        y, _ = self.self_attn(
+            x,
+            x,
+            x,
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+            need_weights=False,
+        )
+        return self.dropout1(y)
+
+    def _ff(self, x: torch.Tensor):
+        y = self.linear2(self.dropout(self.act(self.linear1(x))))
+        return self.dropout2(y)
+
+    def forward(self, x: torch.Tensor, *, key_padding_mask: torch.Tensor, attn_mask: Optional[torch.Tensor]):
+        if self.norm_first:
+            x = x + self._sa(self.norm1(x), key_padding_mask=key_padding_mask, attn_mask=attn_mask)
+            x = x + self._ff(self.norm2(x))
+            return x
+        x = self.norm1(x + self._sa(x, key_padding_mask=key_padding_mask, attn_mask=attn_mask))
+        x = self.norm2(x + self._ff(x))
+        return x
+
+
+class _DRBiasedEncoder(nn.Module):
+    """Stack of encoder layers. Adds dR Gaussian bias to attention logits."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        activation: str,
+        norm_first: bool,
+        num_layers: int,
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                _DRBiasedEncoderLayer(
+                    d_model=int(d_model),
+                    nhead=int(nhead),
+                    dim_feedforward=int(dim_feedforward),
+                    dropout=float(dropout),
+                    activation=str(activation),
+                    norm_first=bool(norm_first),
+                )
+                for _ in range(int(num_layers))
+            ]
+        )
+        self.nhead = int(nhead)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        coords: Optional[torch.Tensor],
+        dr_sigma: float,
+        dr_gamma: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # x: [B,S,E], mask: [B,S]
+        kp = ~mask  # True means pad
+        attn_mask = None
+        if coords is not None and dr_gamma is not None:
+            # coords: [B,S,2] (dEta,dPhi), compute dR^2
+            c = torch.nan_to_num(coords, nan=0.0, posinf=0.0, neginf=0.0)
+            d = c.unsqueeze(2) - c.unsqueeze(1)  # [B,S,S,2]
+            dr2 = (d[..., 0] ** 2 + d[..., 1] ** 2).clamp_min(0.0)  # [B,S,S]
+            sigma2 = float(dr_sigma) ** 2 + 1e-8
+            # Gaussian bias: -gamma * dr^2 / (2*sigma^2)；gamma 可学习
+            gamma = dr_gamma.to(dtype=dr2.dtype)
+            bias = -(gamma * dr2) / (2.0 * sigma2)  # [B,S,S]
+            # Mask out padding tokens (queries or keys)
+            bias = bias.masked_fill(kp.unsqueeze(1), float("-inf"))
+            bias = bias.masked_fill(kp.unsqueeze(2), float("-inf"))
+            # Expand to (B*nhead, S, S) for MultiheadAttention
+            attn_mask = bias.repeat_interleave(self.nhead, dim=0)
+
+        h = x
+        for layer in self.layers:
+            h = layer(h, key_padding_mask=kp, attn_mask=attn_mask)
+        return h
 
 
 def obj_prob_from_logits(obj_logit: torch.Tensor) -> torch.Tensor:

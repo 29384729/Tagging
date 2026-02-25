@@ -457,6 +457,9 @@ class ParentRecoDataset(Dataset):
         mask_hlt: np.ndarray,
         off_child_feat_std: np.ndarray,
         k_max: int,
+        # Optional raw HLT tokens + axis for physical auxiliary losses (px/py)
+        hlt_raw: Optional[np.ndarray] = None,
+        hlt_axis: Optional[np.ndarray] = None,
         # Optionally add full token-level supervision for auxiliary losses in Stage2
         parent_gt: Optional[np.ndarray] = None,
     ):
@@ -468,6 +471,8 @@ class ParentRecoDataset(Dataset):
         self.off_child_feat_std = torch.tensor(off_child_feat_std, dtype=torch.float32)
         self.k_max = int(k_max)
         self.parent_gt = None if parent_gt is None else torch.tensor(parent_gt, dtype=torch.float32)
+        self.hlt_raw = None if hlt_raw is None else torch.tensor(hlt_raw, dtype=torch.float32)
+        self.hlt_axis = None if hlt_axis is None else torch.tensor(hlt_axis, dtype=torch.float32)
 
     def __len__(self):
         return int(self.sel.shape[0])
@@ -491,6 +496,11 @@ class ParentRecoDataset(Dataset):
             "tgt_mask": tgt_mask,  # objectness 的 GT（每个 slot 是否真实存在）
             "m_true": torch.tensor(float(m), dtype=torch.float32),
         }
+        # 提供 px/py 守恒辅助 loss 所需量：parent(pt,phi) 和 jet_phi
+        if self.hlt_raw is not None and self.hlt_axis is not None:
+            out["parent_pt"] = self.hlt_raw[jet_idx, int(parent_idx), 0]
+            out["parent_phi"] = self.hlt_raw[jet_idx, int(parent_idx), 2]
+            out["jet_phi"] = self.hlt_axis[jet_idx, 1]
         if self.parent_gt is not None:
             out["parent_gt"] = self.parent_gt[jet_idx]
         return out
@@ -575,6 +585,67 @@ class TrainCfgRecoObj:
     enc_lr_mult: float = 0.1
     # 可选：在 Stage2 加一个小权重 parentness aux，避免 parentness drift
     w_parent_aux: float = 0.0
+    # 可选：px/py 守恒（方案B），守恒到 HLT parent raw token 的 (pt,phi)
+    w_pxy: float = 0.0
+    pxy_eps: float = 1e-6
+
+
+def _pxy_loss_B(
+    pred_child_std: torch.Tensor,
+    tgt_mask: torch.Tensor,
+    *,
+    feat_means: torch.Tensor,
+    feat_stds: torch.Tensor,
+    jet_phi: torch.Tensor,
+    parent_pt: torch.Tensor,
+    parent_phi: torch.Tensor,
+    pxy_eps: float,
+) -> torch.Tensor:
+    """
+    px/py 守恒（方案B，相对向量误差），只对 GT slot(tgt_mask) 求和。
+    Args:
+      pred_child_std: [B,K,D] 标准化后的 child 预测
+      tgt_mask: [B,K] bool
+      feat_means/stds: [D]
+      jet_phi: [B] HLT jet axis phi
+      parent_pt: [B] HLT raw parent token pt
+      parent_phi: [B] HLT raw parent token phi
+    """
+    eps = float(pxy_eps)
+    B, K, D = pred_child_std.shape
+    means = feat_means.view(1, 1, -1)
+    stds = feat_stds.view(1, 1, -1)
+    feats = pred_child_std * stds + means  # [B,K,D] unstandardized feats
+
+    # indices depend on feature dim
+    if int(D) == 4:
+        log_pt = feats[..., 0]
+        dphi = feats[..., 2]
+    elif int(D) >= 7:
+        dphi = feats[..., 1]
+        log_pt = feats[..., 2]
+    else:
+        raise ValueError(f"Unsupported child dim for pxy loss: {D}")
+
+    pt = torch.exp(log_pt).clamp_min(0.0)
+    phi = torch.atan2(torch.sin(jet_phi.view(B, 1) + dphi), torch.cos(jet_phi.view(B, 1) + dphi))
+
+    px = pt * torch.cos(phi)
+    py = pt * torch.sin(phi)
+
+    m = tgt_mask.to(dtype=px.dtype)
+    sum_px = (px * m).sum(dim=1)
+    sum_py = (py * m).sum(dim=1)
+
+    ppx = parent_pt * torch.cos(parent_phi)
+    ppy = parent_pt * torch.sin(parent_phi)
+
+    dx = sum_px - ppx
+    dy = sum_py - ppy
+    num = torch.sqrt(dx * dx + dy * dy + eps)
+    den = torch.sqrt(ppx * ppx + ppy * ppy + eps)
+    rel = num / den
+    return rel.mean()
 
 
 def _cosine_schedule(ep: int, warmup: int, total: int) -> float:
@@ -694,15 +765,30 @@ def train_parentness(
 
 
 @torch.no_grad()
-def eval_reco_obj(model, loader, device: torch.device, *, cfg: TrainCfgRecoObj, pos_weight_parent: float = 1.0) -> dict[str, float]:
+def eval_reco_obj(
+    model,
+    loader,
+    device: torch.device,
+    *,
+    cfg: TrainCfgRecoObj,
+    pos_weight_parent: float = 1.0,
+    feat_means: Optional[np.ndarray] = None,
+    feat_stds: Optional[np.ndarray] = None,
+) -> dict[str, float]:
     model.eval()
     tot = 0.0
     tot_reco = 0.0
     tot_obj = 0.0
     tot_parent_aux = 0.0
+    tot_pxy = 0.0
     nb = 0
     mae_L = 0.0
     slot_tp = slot_fp = slot_fn = 0
+    feat_means_t = None
+    feat_stds_t = None
+    if feat_means is not None and feat_stds is not None:
+        feat_means_t = torch.tensor(np.asarray(feat_means, dtype=np.float32), device=device)
+        feat_stds_t = torch.tensor(np.asarray(feat_stds, dtype=np.float32), device=device)
     for batch in loader:
         x = batch["hlt"].to(device)
         m = batch["mask_hlt"].to(device)
@@ -726,6 +812,31 @@ def eval_reco_obj(model, loader, device: torch.device, *, cfg: TrainCfgRecoObj, 
         loss = float(cfg.w_reco) * loss_reco + float(cfg.w_obj) * loss_obj
         tot_reco += float(loss_reco.item())
         tot_obj += float(loss_obj.item())
+
+        # optional px/py conservation (scheme B) to HLT parent raw token
+        if (
+            float(getattr(cfg, "w_pxy", 0.0)) > 0.0
+            and feat_means_t is not None
+            and feat_stds_t is not None
+            and ("parent_pt" in batch)
+            and ("parent_phi" in batch)
+            and ("jet_phi" in batch)
+        ):
+            parent_pt = batch["parent_pt"].to(device)
+            parent_phi = batch["parent_phi"].to(device)
+            jet_phi = batch["jet_phi"].to(device)
+            loss_pxy = _pxy_loss_B(
+                pred,
+                tgt_mask,
+                feat_means=feat_means_t,
+                feat_stds=feat_stds_t,
+                jet_phi=jet_phi,
+                parent_pt=parent_pt,
+                parent_phi=parent_phi,
+                pxy_eps=float(getattr(cfg, "pxy_eps", 1e-6)),
+            )
+            loss = loss + float(cfg.w_pxy) * loss_pxy
+            tot_pxy += float(loss_pxy.item())
 
         # optional aux parentness loss（防 drift）
         if float(getattr(cfg, "w_parent_aux", 0.0)) > 0.0 and ("parent_gt" in batch):
@@ -759,6 +870,7 @@ def eval_reco_obj(model, loader, device: torch.device, *, cfg: TrainCfgRecoObj, 
         "loss_reco": tot_reco / max(1, nb),
         "loss_obj": tot_obj / max(1, nb),
         "loss_parent_aux": tot_parent_aux / max(1, nb),
+        "loss_pxy": tot_pxy / max(1, nb),
         "mae_L_vs_m": mae_L / max(1, nb) if nb > 0 else float("nan"),
         "slot_prec": float(prec),
         "slot_rec": float(rec),
@@ -772,6 +884,8 @@ def train_reco_teacher_forced_obj(
     device: torch.device,
     cfg: TrainCfgRecoObj,
     *,
+    feat_means: np.ndarray,
+    feat_stds: np.ndarray,
     pos_weight_parent: float = 1.0,
     ckpt_path: Optional[str | Path] = None,
 ) -> dict[str, Any]:
@@ -834,6 +948,8 @@ def train_reco_teacher_forced_obj(
     if sum(len(g["params"]) for g in param_groups) == 0:
         raise RuntimeError("No trainable parameters found for reco training (check freeze/lr settings).")
     opt = torch.optim.AdamW(param_groups, lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
+    feat_means_t = torch.tensor(np.asarray(feat_means, dtype=np.float32), device=device)
+    feat_stds_t = torch.tensor(np.asarray(feat_stds, dtype=np.float32), device=device)
 
     best = float("inf")
     best_state = None
@@ -864,6 +980,7 @@ def train_reco_teacher_forced_obj(
         running_reco = 0.0
         running_obj = 0.0
         running_parent_aux = 0.0
+        running_pxy = 0.0
         n = 0
         for batch in train_loader:
             x = batch["hlt"].to(device)
@@ -887,6 +1004,24 @@ def train_reco_teacher_forced_obj(
 
             loss = float(cfg.w_reco) * loss_reco + float(cfg.w_obj) * loss_obj
 
+            # optional px/py conservation (scheme B) to HLT parent raw token
+            if float(getattr(cfg, "w_pxy", 0.0)) > 0.0 and ("parent_pt" in batch) and ("parent_phi" in batch) and ("jet_phi" in batch):
+                parent_pt = batch["parent_pt"].to(device)
+                parent_phi = batch["parent_phi"].to(device)
+                jet_phi = batch["jet_phi"].to(device)
+                loss_pxy = _pxy_loss_B(
+                    pred,
+                    tgt_mask,
+                    feat_means=feat_means_t,
+                    feat_stds=feat_stds_t,
+                    jet_phi=jet_phi,
+                    parent_pt=parent_pt,
+                    parent_phi=parent_phi,
+                    pxy_eps=float(getattr(cfg, "pxy_eps", 1e-6)),
+                )
+                loss = loss + float(cfg.w_pxy) * loss_pxy
+                running_pxy += float(loss_pxy.item())
+
             # optional aux parentness
             if float(getattr(cfg, "w_parent_aux", 0.0)) > 0.0 and ("parent_gt" in batch):
                 y_parent = batch["parent_gt"].to(device)
@@ -903,7 +1038,15 @@ def train_reco_teacher_forced_obj(
             running_obj += float(loss_obj.item())
             n += 1
 
-        val = eval_reco_obj(model, val_loader, device, cfg=cfg, pos_weight_parent=float(pos_weight_parent))
+        val = eval_reco_obj(
+            model,
+            val_loader,
+            device,
+            cfg=cfg,
+            pos_weight_parent=float(pos_weight_parent),
+            feat_means=feat_means,
+            feat_stds=feat_stds,
+        )
         if float(val["loss"]) < best - 1e-6:
             best = float(val["loss"])
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -917,18 +1060,20 @@ def train_reco_teacher_forced_obj(
         hist["train_reco"].append(float(running_reco / max(1, n)))
         hist["train_obj"].append(float(running_obj / max(1, n)))
         hist["train_parent_aux"].append(float(running_parent_aux / max(1, n)))
+        hist.setdefault("train_pxy", []).append(float(running_pxy / max(1, n)))
         hist["val_total"].append(float(val["loss"]))
         hist["val_reco"].append(float(val["loss_reco"]))
         hist["val_obj"].append(float(val["loss_obj"]))
         hist["val_parent_aux"].append(float(val["loss_parent_aux"]))
+        hist.setdefault("val_pxy", []).append(float(val.get("loss_pxy", 0.0)))
         hist["val_mae_L"].append(float(val["mae_L_vs_m"]))
         hist["val_slot_prec"].append(float(val["slot_prec"]))
         hist["val_slot_rec"].append(float(val["slot_rec"]))
 
         print(
             f"[Reco+Obj] Ep {ep:03d}: train_total={hist['train_total'][-1]:.4f} "
-            f"(reco={hist['train_reco'][-1]:.4f}, obj={hist['train_obj'][-1]:.4f}, p_aux={hist['train_parent_aux'][-1]:.4f}) "
-            f"val_total={val['loss']:.4f} (reco={val['loss_reco']:.4f}, obj={val['loss_obj']:.4f}, p_aux={val['loss_parent_aux']:.4f}) "
+            f"(reco={hist['train_reco'][-1]:.4f}, obj={hist['train_obj'][-1]:.4f}, p_aux={hist['train_parent_aux'][-1]:.4f}, pxy={hist['train_pxy'][-1]:.4f}) "
+            f"val_total={val['loss']:.4f} (reco={val['loss_reco']:.4f}, obj={val['loss_obj']:.4f}, p_aux={val['loss_parent_aux']:.4f}, pxy={val.get('loss_pxy', 0.0):.4f}) "
             f"maeL={val['mae_L_vs_m']:.3f} slot_prec={val['slot_prec']:.3f} slot_rec={val['slot_rec']:.3f} "
             f"no_imp={no_imp}"
         )
