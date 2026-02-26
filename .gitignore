@@ -11,3 +11,6 @@ runs*/
 # OS/editor
 .DS_Store
 Thumbs.db
+
+# data
+test.h5
