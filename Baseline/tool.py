@@ -205,16 +205,21 @@ def apply_hlt_effects(const: np.ndarray, mask: np.ndarray, config: dict, seed: i
     3) resolution smearing
     4) random efficiency loss
     """
-    np.random.seed(int(seed))
+    # 注意：不要在这里调用 np.random.seed(...)，否则会污染全局 RNG 状态，
+    # 影响外部（例如 DataLoader、别的增强/采样代码）的随机流程。
+    # 这里用局部 RandomState 保持可复现，同时不改变全局随机序列。
+    rs = np.random.RandomState(int(seed))
     cfg = config["hlt_effects"]
     n_jets, max_part, _ = const.shape
     hlt = const.copy()
     hlt_mask = mask.copy()
 
     # Effect 1: Higher pT threshold
-    below_threshold = (hlt[:, :, 0] < float(cfg["pt_threshold_hlt"])) & hlt_mask
-    hlt_mask[below_threshold] = False
-    hlt[~hlt_mask] = 0
+    threshold_enabled = bool(cfg.get("threshold_enabled", True))
+    if threshold_enabled:
+        below_threshold = (hlt[:, :, 0] < float(cfg["pt_threshold_hlt"])) & hlt_mask
+        hlt_mask[below_threshold] = False
+        hlt[~hlt_mask] = 0
 
     # Effect 2: Cluster merging
     if bool(cfg["merge_enabled"]) and float(cfg["merge_radius"]) > 0:
@@ -255,22 +260,24 @@ def apply_hlt_effects(const: np.ndarray, mask: np.ndarray, config: dict, seed: i
                 hlt[jet_idx, idx] = 0
 
     # Effect 3: Resolution smearing
-    valid = hlt_mask.copy()
-    pt_noise = np.clip(
-        np.random.normal(1.0, float(cfg["pt_resolution"]), (n_jets, max_part)), 0.5, 1.5
-    )
-    hlt[:, :, 0] = np.where(valid, hlt[:, :, 0] * pt_noise, 0)
-    eta_noise = np.random.normal(0, float(cfg["eta_resolution"]), (n_jets, max_part))
-    hlt[:, :, 1] = np.where(valid, np.clip(hlt[:, :, 1] + eta_noise, -5, 5), 0)
-    phi_noise = np.random.normal(0, float(cfg["phi_resolution"]), (n_jets, max_part))
-    new_phi = hlt[:, :, 2] + phi_noise
-    hlt[:, :, 2] = np.where(valid, np.arctan2(np.sin(new_phi), np.cos(new_phi)), 0)
-    hlt[:, :, 3] = np.where(valid, hlt[:, :, 0] * np.cosh(np.clip(hlt[:, :, 1], -5, 5)), 0)
+    smear_enabled = bool(cfg.get("smear_enabled", True))
+    if smear_enabled:
+        valid = hlt_mask.copy()
+        pt_noise = np.clip(
+            rs.normal(1.0, float(cfg["pt_resolution"]), (n_jets, max_part)), 0.5, 1.5
+        )
+        hlt[:, :, 0] = np.where(valid, hlt[:, :, 0] * pt_noise, 0)
+        eta_noise = rs.normal(0, float(cfg["eta_resolution"]), (n_jets, max_part))
+        hlt[:, :, 1] = np.where(valid, np.clip(hlt[:, :, 1] + eta_noise, -5, 5), 0)
+        phi_noise = rs.normal(0, float(cfg["phi_resolution"]), (n_jets, max_part))
+        new_phi = hlt[:, :, 2] + phi_noise
+        hlt[:, :, 2] = np.where(valid, np.arctan2(np.sin(new_phi), np.cos(new_phi)), 0)
+        hlt[:, :, 3] = np.where(valid, hlt[:, :, 0] * np.cosh(np.clip(hlt[:, :, 1], -5, 5)), 0)
 
     # Effect 4: Random efficiency loss
     eff = float(cfg.get("efficiency_loss", 0.0))
     if eff > 0:
-        lost = (np.random.random((n_jets, max_part)) < eff) & hlt_mask
+        lost = (rs.random_sample((n_jets, max_part)) < eff) & hlt_mask
         hlt_mask[lost] = False
         hlt[lost] = 0
 

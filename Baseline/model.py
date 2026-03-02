@@ -17,7 +17,8 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(int(dim), int(dim)),
-            nn.BatchNorm1d(int(dim)),
+            # LayerNorm：对每个样本（token / pooled 向量）按特征维归一化，不依赖 batch 统计
+            nn.LayerNorm(int(dim)),
             nn.GELU(),
             nn.Dropout(float(dropout)),
         )
@@ -53,7 +54,8 @@ class ParticleTransformerKD(nn.Module):
 
         self.input_proj = nn.Sequential(
             nn.Linear(self.input_dim, self.embed_dim),
-            nn.BatchNorm1d(self.embed_dim),
+            # LayerNorm：避免 padding/mask token 污染 BatchNorm 的统计量
+            nn.LayerNorm(self.embed_dim),
             nn.GELU(),
             nn.Dropout(float(dropout)),
         )
@@ -77,12 +79,12 @@ class ParticleTransformerKD(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.Linear(self.embed_dim, 128),
-            nn.BatchNorm1d(128),
+            nn.LayerNorm(128),
             nn.GELU(),
             nn.Dropout(float(dropout)),
             ResidualBlock(128, dropout=float(dropout)),
             nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
+            nn.LayerNorm(64),
             nn.GELU(),
             nn.Dropout(float(dropout)),
             nn.Linear(64, 1),
