@@ -205,9 +205,9 @@ def apply_hlt_effects(const: np.ndarray, mask: np.ndarray, config: dict, seed: i
     3) resolution smearing
     4) random efficiency loss
     """
-    # 注意：不要在这里调用 np.random.seed(...)，否则会污染全局 RNG 状态，
-    # 影响外部（例如 DataLoader、别的增强/采样代码）的随机流程。
-    # 这里用局部 RandomState 保持可复现，同时不改变全局随机序列。
+    # Note: do NOT call np.random.seed(...) here, otherwise you will pollute the global RNG state
+    # and affect external randomness (e.g. DataLoader shuffling, other augmentations/samplers).
+    # We use a local RandomState to keep reproducibility without changing the global random stream.
     rs = np.random.RandomState(int(seed))
     cfg = config["hlt_effects"]
     n_jets, max_part, _ = const.shape

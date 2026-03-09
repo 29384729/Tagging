@@ -1371,19 +1371,34 @@ def plot_roc_curves(
     title: str = "ROC (test)",
     save_path: str | Path | None = None,
     dpi: int = 160,
+    log_fpr: bool = False,
+    fpr_clip: float = 1e-6,
 ):
     """curves[name] = (fpr, tpr, auc)."""
     import matplotlib.pyplot as plt  # type: ignore
 
     plt.figure(figsize=(6.8, 6.0))
     for name, (fpr, tpr, auc) in curves.items():
-        plt.plot(fpr, tpr, label=f"{name} (AUC={auc:.4f})")
-    plt.plot([0, 1], [0, 1], "k--", linewidth=1)
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
+        if bool(log_fpr):
+            # x=TPR, y=FPR(log)（与 unsmear notebook 的绘图风格一致）
+            y = np.clip(fpr, float(fpr_clip), 1.0)
+            plt.semilogy(tpr, y, label=f"{name} (AUC={auc:.4f})")
+        else:
+            plt.plot(fpr, tpr, label=f"{name} (AUC={auc:.4f})")
+
+    if bool(log_fpr):
+        plt.xlabel("TPR")
+        plt.ylabel("FPR (log)")
+        plt.xlim(0.0, 1.0)
+        plt.ylim(max(float(fpr_clip), 1e-6), 1.0)
+        plt.grid(True, which="both", alpha=0.25)
+    else:
+        plt.plot([0, 1], [0, 1], "k--", linewidth=1)
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.grid(True, alpha=0.25)
     plt.title(title)
     plt.legend()
-    plt.grid(True, alpha=0.25)
     plt.tight_layout()
     if save_path is not None:
         p = Path(save_path)
