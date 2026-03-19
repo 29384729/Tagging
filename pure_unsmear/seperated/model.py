@@ -287,10 +287,10 @@ class TokenTransformerRegressor(nn.Module):
 
         h = self.input_proj(inp.reshape(B * S, -1)).reshape(B, S, self.embed_dim)
         if self.pos_embed is not None:
-            # 用可学习的 rank embedding 显式编码序列位置，保留 pt 排序带来的先验。
+            # Use learnable rank embeddings to encode token order explicitly and preserve the pt-sorting prior.
             pos_idx = torch.arange(S, device=x.device)
             h = h + self.pos_embed(pos_idx).unsqueeze(0)
-        # 先压掉 padding 位置的特征，减小残差支路在无效 token 上的漂移。
+        # Zero out padding positions first to reduce drift on invalid tokens in the residual branch.
         h = h * mask.to(dtype=h.dtype).unsqueeze(-1)
         h = self.encoder(h, src_key_padding_mask=~mask)
         out = self.head(h)
@@ -309,6 +309,134 @@ class TokenTransformerRegressor(nn.Module):
         if self.mask_output:
             y = y * mask.to(dtype=y.dtype).unsqueeze(-1)
         return y
+
+
+class SharedEncoderUnsmearClassifier(nn.Module):
+    """Joint model with a shared encoder for unsmear regression and jet classification."""
+
+    def __init__(
+        self,
+        *,
+        input_dim: int = 7,
+        embed_dim: int = 128,
+        num_heads: int = 8,
+        num_layers: int = 4,
+        ff_dim: int = 512,
+        dropout: float = 0.1,
+        return_reco: bool = True,
+        add_mask_channel: bool = True,
+        mask_output: bool = True,
+        use_positional_embedding: bool = True,
+        max_seq_len: int = 128,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.embed_dim = int(embed_dim)
+        self.return_reco = bool(return_reco)
+        self.add_mask_channel = bool(add_mask_channel)
+        self.mask_output = bool(mask_output)
+        self.use_positional_embedding = bool(use_positional_embedding)
+        self.max_seq_len = int(max_seq_len)
+
+        in_dim = self.input_dim + (1 if self.add_mask_channel else 0)
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+        )
+        if self.use_positional_embedding:
+            self.pos_embed = nn.Embedding(self.max_seq_len, self.embed_dim)
+        else:
+            self.pos_embed = None
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=self.embed_dim,
+            nhead=int(num_heads),
+            dim_feedforward=int(ff_dim),
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=int(num_layers))
+
+        self.unsmear_head = nn.Sequential(
+            nn.LayerNorm(self.embed_dim),
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.embed_dim, self.input_dim),
+        )
+
+        self.pool_query = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.02)
+        self.pool_attn = nn.MultiheadAttention(
+            self.embed_dim, num_heads=4, dropout=float(dropout), batch_first=True
+        )
+        self.cls_norm = nn.LayerNorm(self.embed_dim)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.embed_dim, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            ResidualBlock(128, dropout=float(dropout)),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(64, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        if self.pos_embed is not None:
+            nn.init.normal_(self.pos_embed.weight, mean=0.0, std=0.02)
+
+    def encode(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the shared encoder."""
+        B, S, _ = x.shape
+        if self.pos_embed is not None and S > self.max_seq_len:
+            raise ValueError(f"Sequence length {S} exceeds max_seq_len={self.max_seq_len}")
+
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        inp = x
+        if self.add_mask_channel:
+            inp = torch.cat([inp, mask.to(dtype=x.dtype).unsqueeze(-1)], dim=-1)
+
+        h = self.input_proj(inp.reshape(B * S, -1)).reshape(B, S, self.embed_dim)
+        if self.pos_embed is not None:
+            pos_idx = torch.arange(S, device=x.device)
+            h = h + self.pos_embed(pos_idx).unsqueeze(0)
+        h = h * mask.to(dtype=h.dtype).unsqueeze(-1)
+        h = self.encoder(h, src_key_padding_mask=~mask)
+        return h
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, *, return_attention: bool = False):
+        """Return `(reco, logits)` and optionally the pooling attention weights."""
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        h = self.encode(x, mask)
+
+        delta = self.unsmear_head(h)
+        reco = (x + delta) if self.return_reco else delta
+        if self.mask_output:
+            reco = reco * mask.to(dtype=reco.dtype).unsqueeze(-1)
+
+        q = self.pool_query.expand(x.shape[0], -1, -1)
+        pooled, attn = self.pool_attn(
+            q, h, h, key_padding_mask=~mask, need_weights=True, average_attn_weights=True
+        )
+        z = self.cls_norm(pooled.squeeze(1))
+        logits = self.classifier(z)
+
+        if return_attention:
+            return reco, logits, attn.squeeze(1)
+        return reco, logits
 
 
 class _ConvBlock1D(nn.Module):
@@ -512,15 +640,24 @@ class CondFlowMatcher(nn.Module):
         time_n_freqs: int = 16,
         time_max_freq: float = 200.0,
         time_t_eps: float = 1e-4,
+        per_layer_cond: bool = False,
         w_dr: float = 0.0,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.embed_dim = int(embed_dim)
+        self.per_layer_cond = bool(per_layer_cond)
 
-        # x_t and cond (x_post) are concatenated per token
+        in_dim = self.input_dim * (2 if not self.per_layer_cond else 1)
+        # By default keep the old input-level conditioning; with per-layer conditioning enabled, only x_t is encoded at the input.
         self.in_proj = nn.Sequential(
-            nn.Linear(self.input_dim * 2, self.embed_dim),
+            nn.Linear(in_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+        )
+        self.cond_proj = nn.Sequential(
+            nn.Linear(self.input_dim, self.embed_dim),
             nn.LayerNorm(self.embed_dim),
             nn.GELU(),
             nn.Dropout(float(dropout)),
@@ -532,16 +669,46 @@ class CondFlowMatcher(nn.Module):
             t_eps=float(time_t_eps),
         )
 
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim,
-            nhead=int(num_heads),
-            dim_feedforward=int(ff_dim),
-            dropout=float(dropout),
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=int(num_layers))
+        if self.per_layer_cond:
+            self.layers = nn.ModuleList(
+                [
+                    nn.TransformerEncoderLayer(
+                        d_model=self.embed_dim,
+                        nhead=int(num_heads),
+                        dim_feedforward=int(ff_dim),
+                        dropout=float(dropout),
+                        activation="gelu",
+                        batch_first=True,
+                        norm_first=True,
+                    )
+                    for _ in range(int(num_layers))
+                ]
+            )
+            self.layer_cond_mix = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.LayerNorm(self.embed_dim * 2),
+                        nn.Linear(self.embed_dim * 2, self.embed_dim),
+                        nn.GELU(),
+                        nn.Dropout(float(dropout)),
+                    )
+                    for _ in range(int(num_layers))
+                ]
+            )
+            self.time_layers = nn.ModuleList(
+                [nn.Linear(self.embed_dim, self.embed_dim) for _ in range(int(num_layers))]
+            )
+        else:
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=self.embed_dim,
+                nhead=int(num_heads),
+                dim_feedforward=int(ff_dim),
+                dropout=float(dropout),
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(enc_layer, num_layers=int(num_layers))
 
         self.head = nn.Sequential(
             nn.LayerNorm(self.embed_dim),
@@ -564,12 +731,23 @@ class CondFlowMatcher(nn.Module):
         B, S, _ = x_t.shape
         x_t = torch.nan_to_num(x_t, nan=0.0, posinf=0.0, neginf=0.0)
         cond = torch.nan_to_num(cond, nan=0.0, posinf=0.0, neginf=0.0)
-        inp = torch.cat([x_t, cond], dim=-1)  # [B,S,2D]
+        if self.per_layer_cond:
+            inp = x_t
+        else:
+            inp = torch.cat([x_t, cond], dim=-1)  # [B,S,2D]
 
-        h = self.in_proj(inp.view(B * S, self.input_dim * 2)).view(B, S, self.embed_dim)
+        h = self.in_proj(inp.view(B * S, -1)).view(B, S, self.embed_dim)
+        cond_h = self.cond_proj(cond.view(B * S, self.input_dim)).view(B, S, self.embed_dim)
         te = self.time(t).view(B, 1, self.embed_dim)
-        h = h + te
-        h = self.encoder(h, src_key_padding_mask=~mask)
+        if self.per_layer_cond:
+            # Closer to DiffLense: each layer concatenates the current hidden state with the condition before linear mixing.
+            for layer, cond_mix, time_layer in zip(self.layers, self.layer_cond_mix, self.time_layers):
+                h = cond_mix(torch.cat([h, cond_h], dim=-1))
+                h = h + time_layer(te)
+                h = layer(h, src_key_padding_mask=~mask)
+        else:
+            h = h + te
+            h = self.encoder(h, src_key_padding_mask=~mask)
         v = self.head(h)
         return v
 
