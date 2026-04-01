@@ -64,42 +64,6 @@ def load_checkpoint(
     return payload if isinstance(payload, dict) else {"state_dict": state}
 
 
-def save_rows_csv(path: str | Path, rows: Sequence[dict[str, Any]]) -> Path:
-    """Save a list of dict rows as CSV."""
-    p = Path(path)
-    ensure_dir(p.parent)
-    rows = list(rows)
-    fieldnames: list[str] = []
-    for row in rows:
-        for key in row.keys():
-            if key not in fieldnames:
-                fieldnames.append(str(key))
-    if not fieldnames:
-        fieldnames = ["empty"]
-        rows = [{"empty": ""}]
-    _write_csv_rows(p, fieldnames, rows)
-    return p
-
-
-def save_prediction_bundle(
-    path: str | Path,
-    *,
-    preds: np.ndarray,
-    labels: np.ndarray,
-    weights: np.ndarray,
-) -> Path:
-    """Save predictions / labels / weights into a compressed NPZ bundle."""
-    p = Path(path)
-    ensure_dir(p.parent)
-    np.savez_compressed(
-        p,
-        preds=np.asarray(preds, dtype=np.float32),
-        labels=np.asarray(labels, dtype=np.float32),
-        weights=np.asarray(weights, dtype=np.float32),
-    )
-    return p
-
-
 def wrap_dphi_np(dphi: np.ndarray) -> np.ndarray:
     """Wrap an angular difference into (-pi, pi]."""
     return np.arctan2(np.sin(dphi), np.cos(dphi))
@@ -963,18 +927,6 @@ def compute_roc(
     return fpr, tpr, auc, auc_weighted
 
 
-def fpr_at_target_tpr(tpr: np.ndarray, fpr: np.ndarray, target_tpr: float) -> float:
-    """Interpolate the FPR at a target TPR."""
-    tpr = np.asarray(tpr, dtype=np.float64)
-    fpr = np.asarray(fpr, dtype=np.float64)
-    order = np.argsort(tpr)
-    tpr_sorted = tpr[order]
-    fpr_sorted = fpr[order]
-    tpr_unique, unique_idx = np.unique(tpr_sorted, return_index=True)
-    fpr_unique = fpr_sorted[unique_idx]
-    return float(np.interp(float(target_tpr), tpr_unique, fpr_unique))
-
-
 def resolve_early_stop_metric_name(metric_name: str) -> str:
     """Validate and normalize the early-stopping metric name."""
     normalized = str(metric_name).strip()
@@ -1641,6 +1593,8 @@ def save_epoch_metrics_table(path: str | Path, rows: list[dict[str, Any]]) -> Pa
         "train_uns",
         "train_phys",
         "train_cls",
+        "train_gate_mean",
+        "train_gate_std",
         "val_loss",
         "val_total",
         "val_hard",
@@ -1650,8 +1604,11 @@ def save_epoch_metrics_table(path: str | Path, rows: list[dict[str, Any]]) -> Pa
         "val_uns",
         "val_phys",
         "val_cls",
+        "val_gate_mean",
+        "val_gate_std",
         "val_auc",
         "val_auc_weighted",
+        "alpha",
         "best_auc",
         "best_auc_weighted",
         "no_imp",
@@ -2380,6 +2337,8 @@ def eval_joint_model(
         "cls_kd_total": 0.0,
         "cls_attn_total": 0.0,
         "cls_total": 0.0,
+        "gate_mean_total": 0.0,
+        "gate_std_total": 0.0,
     }
     preds, labs, weights = [], [], []
     total_mix_den = 0.0
@@ -2394,9 +2353,9 @@ def eval_joint_model(
 
         kd_attn_enabled = kd_enabled and (float(kd_alpha_attn) > 0.0)
         if kd_attn_enabled:
-            reco, logits, s_attn = model(x, m, return_attention=True)
+            reco, logits, s_attn, cls_aux = model(x, m, return_attention=True, return_aux=True)
         else:
-            reco, logits = model(x, m)
+            reco, logits, cls_aux = model(x, m, return_aux=True)
         aux_weight = _maybe_sample_weight(w, use_sample_weight_for_all_losses)
         reg_terms = regression_loss_terms(
             reco,
@@ -2446,6 +2405,8 @@ def eval_joint_model(
         sums["cls_kd_total"] += float(kd_loss_val.item()) * aux_den
         sums["cls_attn_total"] += float(attn_loss_val.item()) * aux_den
         sums["cls_total"] += float(cls_loss.item()) * mix_den
+        sums["gate_mean_total"] += float(cls_aux["gate_mean"].item()) * mix_den
+        sums["gate_std_total"] += float(cls_aux["gate_std"].item()) * mix_den
         preds.extend(torch.sigmoid(logits.squeeze(-1)).detach().cpu().numpy().flatten())
         labs.extend(y_cls.detach().cpu().numpy().flatten())
         weights.extend(w.detach().cpu().numpy().flatten())
@@ -2470,6 +2431,9 @@ def eval_joint_model(
         "cls_kd_total": sums["cls_kd_total"] / max(total_aux_den, 1e-12),
         "cls_attn_total": sums["cls_attn_total"] / max(total_aux_den, 1e-12),
         "cls_total": sums["cls_total"] / max(total_mix_den, 1e-12),
+        "gate_mean": sums["gate_mean_total"] / max(total_mix_den, 1e-12),
+        "gate_std": sums["gate_std_total"] / max(total_mix_den, 1e-12),
+        "alpha": float(model.get_fusion_alpha().detach().item()) if hasattr(model, "get_fusion_alpha") else 0.0,
     }
     out["auc"] = auc
     out["auc_weighted"] = auc_weighted
@@ -2513,30 +2477,11 @@ def train_or_load_joint_model(
 ):
     """Train or load a joint model."""
     early_stop_metric = resolve_early_stop_metric_name(early_stop_metric)
-    probe_cfg = dict(grad_probe_cfg or {})
-    probe_prefix = probe_cfg.get("output_prefix", None)
-    probe_name = str(probe_cfg.get("model_name", name))
-    train_probe_batches = int(probe_cfg.get("train_batches_per_epoch", 0))
-    val_probe_batches = int(probe_cfg.get("val_batches_per_epoch", 0))
-    probe_enabled = probe_prefix is not None and (train_probe_batches > 0 or val_probe_batches > 0)
     if bool(allow_load) and Path(ckpt_path).is_file():
         load_checkpoint(model, ckpt_path, map_location=device)
         print(f"Loaded checkpoint: {ckpt_path}")
         if epoch_metrics_path is not None and not Path(epoch_metrics_path).is_file():
             print(f"[{name}] Epoch-metrics table not found for the loaded checkpoint. Rerun training with loading disabled to regenerate it.")
-        if probe_enabled:
-            probe_paths = _gradient_probe_output_paths(probe_prefix)
-            if not (probe_paths["scalar"].is_file() and probe_paths["norm"].is_file() and probe_paths["cos"].is_file()):
-                print(f"[{name}] Gradient probe tables not found for the loaded checkpoint. Rerun training with loading disabled to regenerate them.")
-            if not (
-                probe_paths["feature_scalar"].is_file()
-                and probe_paths["feature_norm"].is_file()
-                and probe_paths["feature_cos"].is_file()
-            ):
-                print(
-                    f"[{name}] Feature-level gradient probe tables not found for the loaded checkpoint. "
-                    "Rerun training with loading disabled to regenerate them."
-                )
         return model
 
     kd_enabled = bool(use_kd) and (teacher is not None)
@@ -2553,22 +2498,14 @@ def train_or_load_joint_model(
         epochs=int(epochs),
     )
     best_auc, best_auc_weighted, best_stop_score, best_state, no_imp = 0.0, 0.0, float("-inf"), None, 0
-    probe_scalar_rows: list[dict[str, Any]] = []
-    probe_norm_rows: list[dict[str, Any]] = []
-    probe_cosine_rows: list[dict[str, Any]] = []
-    probe_feature_scalar_rows: list[dict[str, Any]] = []
-    probe_feature_norm_rows: list[dict[str, Any]] = []
-    probe_feature_cosine_rows: list[dict[str, Any]] = []
     metrics_rows: list[dict[str, Any]] = []
     completed_epochs = 0
     for ep in range(1, int(epochs) + 1):
         model.train()
         epoch_train_loader = train_loader_factory(ep) if train_loader_factory is not None else train_loader
-        train_probe_idx = make_even_interval_batch_indices(len(epoch_train_loader), train_probe_batches) if probe_enabled else []
-        train_probe_set = set(train_probe_idx)
-        train_probe_rank = {idx: rank for rank, idx in enumerate(train_probe_idx)}
         train_preds, train_labs, train_weights = [], [], []
         tot_joint, tot_uns, tot_phys, tot_cls, tot_hard, tot_kd, tot_attn = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        tot_gate_mean, tot_gate_std = 0.0, 0.0
         total_mix_den, total_aux_den, total_hard_den = 0.0, 0.0, 0.0
         for batch_idx, batch in enumerate(epoch_train_loader):
             x = batch["x"].to(device)
@@ -2580,9 +2517,9 @@ def train_or_load_joint_model(
             opt.zero_grad(set_to_none=True)
             kd_attn_enabled = kd_enabled and (float(kd_alpha_attn) > 0.0)
             if kd_attn_enabled:
-                reco, logits, s_attn = model(x, m, return_attention=True)
+                reco, logits, s_attn, cls_aux = model(x, m, return_attention=True, return_aux=True)
             else:
-                reco, logits = model(x, m)
+                reco, logits, cls_aux = model(x, m, return_aux=True)
             aux_weight = _maybe_sample_weight(w, use_sample_weight_for_all_losses)
             reg_terms = regression_loss_terms(
                 reco,
@@ -2622,51 +2559,6 @@ def train_or_load_joint_model(
                 )
 
             joint_loss = float(joint_unsmear_weight) * reg_terms["total"] + float(joint_cls_weight) * cls_loss
-            if batch_idx in train_probe_set:
-                diag = gradient_probe_from_losses(
-                    model,
-                    {
-                        "unsmear": reg_terms["total"],
-                        "phys": reg_terms["phys"],
-                        "hard": hard_loss,
-                        "kd": kd_loss_val if kd_enabled else None,
-                        "attn": attn_loss_val if (kd_enabled and float(kd_alpha_attn) > 0.0) else None,
-                        "total": joint_loss,
-                    },
-                )
-                diag["scalar_losses"] = {
-                    "unsmear": float(reg_terms["total"].item()),
-                    "phys": float(reg_terms["phys"].item()),
-                    "hard": float(hard_loss.item()),
-                    "kd": float(kd_loss_val.item()) if kd_enabled else float("nan"),
-                    "attn": float(attn_loss_val.item()) if (kd_enabled and float(kd_alpha_attn) > 0.0) else float("nan"),
-                    "total": float(joint_loss.item()),
-                }
-                diag["feature_probe"] = feature_gradient_probe_from_regression_terms(model, reg_terms)
-                _append_gradient_probe_rows(
-                    scalar_rows=probe_scalar_rows,
-                    norm_rows=probe_norm_rows,
-                    cosine_rows=probe_cosine_rows,
-                    diag=diag,
-                    model_name=probe_name,
-                    split="train",
-                    epoch=int(ep),
-                    batch_idx=int(batch_idx),
-                    sample_idx=int(train_probe_rank[batch_idx]),
-                    total_batches=int(len(epoch_train_loader)),
-                )
-                _append_gradient_probe_rows(
-                    scalar_rows=probe_feature_scalar_rows,
-                    norm_rows=probe_feature_norm_rows,
-                    cosine_rows=probe_feature_cosine_rows,
-                    diag=diag["feature_probe"],
-                    model_name=probe_name,
-                    split="train",
-                    epoch=int(ep),
-                    batch_idx=int(batch_idx),
-                    sample_idx=int(train_probe_rank[batch_idx]),
-                    total_batches=int(len(epoch_train_loader)),
-                )
             joint_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -2681,6 +2573,8 @@ def train_or_load_joint_model(
             tot_hard += float(hard_loss.item()) * hard_den
             tot_kd += float(kd_loss_val.item()) * aux_den
             tot_attn += float(attn_loss_val.item()) * aux_den
+            tot_gate_mean += float(cls_aux["gate_mean"].item()) * mix_den
+            tot_gate_std += float(cls_aux["gate_std"].item()) * mix_den
             train_preds.extend(torch.sigmoid(logits.squeeze(-1)).detach().cpu().numpy().flatten())
             train_labs.extend(y_cls.detach().cpu().numpy().flatten())
             train_weights.extend(w.detach().cpu().numpy().flatten())
@@ -2707,68 +2601,6 @@ def train_or_load_joint_model(
             kd_alpha_attn=float(kd_alpha_attn),
             use_sample_weight_for_all_losses=use_sample_weight_for_all_losses,
         )
-        if probe_enabled and val_probe_batches > 0:
-            val_probe_rows = collect_loader_gradient_probes(
-                loader=val_loader,
-                sample_count=val_probe_batches,
-                probe_fn=lambda batch: probe_joint_gradients(
-                    model,
-                    batch,
-                    device=device,
-                    feat_names=feat_names,
-                    feat_means=feat_means,
-                    feat_stds=feat_stds,
-                    feature_loss_weights=feature_loss_weights,
-                    joint_phys_weight=joint_phys_weight,
-                    teacher=teacher,
-                    use_kd=kd_enabled,
-                    kd_temperature=float(kd_temperature),
-                    kd_alpha=float(kd_alpha),
-                    kd_alpha_attn=float(kd_alpha_attn),
-                    joint_unsmear_weight=float(joint_unsmear_weight),
-                    joint_cls_weight=float(joint_cls_weight),
-                    use_sample_weight_for_all_losses=use_sample_weight_for_all_losses,
-                ),
-                model_name=probe_name,
-                split="val",
-                epoch=int(ep),
-            )
-            probe_scalar_rows.extend(val_probe_rows["scalar_rows"])
-            probe_norm_rows.extend(val_probe_rows["norm_rows"])
-            probe_cosine_rows.extend(val_probe_rows["cosine_rows"])
-            probe_feature_scalar_rows.extend(val_probe_rows["feature_scalar_rows"])
-            probe_feature_norm_rows.extend(val_probe_rows["feature_norm_rows"])
-            probe_feature_cosine_rows.extend(val_probe_rows["feature_cosine_rows"])
-        joint_grad_loss_weights = {
-            "unsmear": float(joint_unsmear_weight),
-            "phys": float(joint_unsmear_weight),
-            "hard": float(joint_cls_weight) * (float(1.0 - kd_alpha) if kd_enabled else 1.0),
-            "kd": float(joint_cls_weight) * float(kd_alpha),
-            "attn": float(joint_cls_weight) * float(kd_alpha_attn),
-        }
-        joint_loss_order = ["unsmear", "phys", "hard"]
-        if kd_enabled:
-            joint_loss_order.extend(["kd", "attn"])
-        train_grad_norm_summary = _format_epoch_mean_grad_norm_summary(
-            probe_norm_rows,
-            epoch=int(ep),
-            split="train",
-            loss_order=joint_loss_order,
-            loss_weights=joint_grad_loss_weights,
-            label="train",
-        )
-        val_grad_norm_summary = _format_epoch_mean_grad_norm_summary(
-            probe_norm_rows,
-            epoch=int(ep),
-            split="val",
-            loss_order=joint_loss_order,
-            loss_weights=joint_grad_loss_weights,
-            label="val",
-        )
-        grad_norm_suffix = ""
-        grad_norm_parts = [part for part in [train_grad_norm_summary, val_grad_norm_summary] if part]
-        if grad_norm_parts:
-            grad_norm_suffix = " " + " ".join(grad_norm_parts)
         train_joint = tot_joint / max(total_mix_den, 1e-12)
         train_uns = tot_uns / max(total_aux_den, 1e-12)
         train_phys = tot_phys / max(total_aux_den, 1e-12)
@@ -2776,12 +2608,15 @@ def train_or_load_joint_model(
         train_hard = tot_hard / max(total_hard_den, 1e-12)
         train_kd = tot_kd / max(total_aux_den, 1e-12)
         train_attn = tot_attn / max(total_aux_den, 1e-12)
+        train_gate_mean = tot_gate_mean / max(total_mix_den, 1e-12)
+        train_gate_std = tot_gate_std / max(total_mix_den, 1e-12)
         train_auc, train_auc_weighted = _auc_scores(
             train_labs,
             train_preds,
             np.asarray(train_weights, dtype=np.float64),
             use_sample_weight=use_sample_weight_for_all_losses,
         )
+        alpha_value = float(model.get_fusion_alpha().detach().item()) if hasattr(model, "get_fusion_alpha") else 0.0
         val_auc = float(val_res["auc"])
         stop_score = select_early_stop_score(
             early_stop_metric,
@@ -2810,6 +2645,8 @@ def train_or_load_joint_model(
                 "train_hard": float(train_hard),
                 "train_kd": float(train_kd),
                 "train_attn": float(train_attn),
+                "train_gate_mean": float(train_gate_mean),
+                "train_gate_std": float(train_gate_std),
                 "train_auc": float(train_auc),
                 "train_auc_weighted": float(train_auc_weighted),
                 "val_joint": float(val_res["joint_total"]),
@@ -2819,8 +2656,11 @@ def train_or_load_joint_model(
                 "val_hard": float(val_res["cls_hard_total"]),
                 "val_kd": float(val_res["cls_kd_total"]),
                 "val_attn": float(val_res["cls_attn_total"]),
+                "val_gate_mean": float(val_res["gate_mean"]),
+                "val_gate_std": float(val_res["gate_std"]),
                 "val_auc": float(val_auc),
                 "val_auc_weighted": float(val_res["auc_weighted"]),
+                "alpha": float(alpha_value),
                 "best_auc": float(best_auc),
                 "best_auc_weighted": float(best_auc_weighted),
                 "no_imp": int(no_imp),
@@ -2832,13 +2672,14 @@ def train_or_load_joint_model(
             print(
                 f"[{name}] ep={ep:03d} train_joint={train_joint:.5f} train_uns={train_uns:.5f} train_phys={train_phys:.5f} "
                 f"train_cls={train_cls:.5f} train_hard={train_hard:.5f} train_kd={train_kd:.5f} train_attn={train_attn:.5f} "
+                f"train_gate={train_gate_mean:.4f}±{train_gate_std:.4f} alpha={alpha_value:.4f} "
                 f"train_auc={train_auc:.5f} train_auc_w={train_auc_weighted:.5f} "
                 f"val_joint={val_res['joint_total']:.5f} val_uns={val_res['unsmear_total']:.5f} val_phys={val_res['phys_total']:.5f} "
                 f"val_cls={val_res['cls_total']:.5f} val_hard={val_res['cls_hard_total']:.5f} "
                 f"val_kd={val_res['cls_kd_total']:.5f} val_attn={val_res['cls_attn_total']:.5f} "
+                f"val_gate={val_res['gate_mean']:.4f}±{val_res['gate_std']:.4f} "
                 f"val_auc={val_auc:.5f} val_auc_w={val_res['auc_weighted']:.5f} "
                 f"monitor={early_stop_metric} best_monitor={best_stop_score:.5f} no_imp={no_imp}"
-                f"{grad_norm_suffix}"
             )
         if no_imp >= int(patience):
             print(f"[{name}] Early stopping")
@@ -2849,28 +2690,6 @@ def train_or_load_joint_model(
         metrics_rows[-1]["stopped_after_epoch"] = int(completed_epochs)
     if epoch_metrics_path is not None:
         save_epoch_metrics_table(epoch_metrics_path, metrics_rows)
-    if probe_enabled:
-        save_gradient_probe_tables(
-            probe_prefix,
-            scalar_rows=probe_scalar_rows,
-            norm_rows=probe_norm_rows,
-            cosine_rows=probe_cosine_rows,
-            feature_scalar_rows=probe_feature_scalar_rows,
-            feature_norm_rows=probe_feature_norm_rows,
-            feature_cosine_rows=probe_feature_cosine_rows,
-            extra_meta={
-                "model_name": probe_name,
-                "train_batches_per_epoch": int(train_probe_batches),
-                "val_batches_per_epoch": int(val_probe_batches),
-                "epochs": int(completed_epochs),
-                "kind": "joint",
-                "kd_enabled": bool(kd_enabled),
-                "joint_phys_weight": float(joint_phys_weight),
-                "feature_loss_weights": _resolve_feature_loss_weights(feat_names, feature_loss_weights).tolist(),
-                "feature_names": list(feat_names),
-                "use_sample_weight_for_all_losses": bool(use_sample_weight_for_all_losses),
-            },
-        )
     save_checkpoint(
         model,
         ckpt_path,
@@ -2881,6 +2700,9 @@ def train_or_load_joint_model(
             "best_stop_score": float(best_stop_score),
             "kd_enabled": bool(kd_enabled),
             "joint_phys_weight": float(joint_phys_weight),
+            "cls_use_delta_fusion": bool(getattr(model, "cls_use_delta_fusion", False)),
+            "cls_detach_delta_for_cls": bool(getattr(model, "cls_detach_delta_for_cls", False)),
+            "cls_alpha": float(model.get_fusion_alpha().detach().item()) if hasattr(model, "get_fusion_alpha") else 0.0,
             "use_sample_weight_for_all_losses": bool(use_sample_weight_for_all_losses),
         },
     )

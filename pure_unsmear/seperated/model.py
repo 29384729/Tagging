@@ -4,7 +4,6 @@ Unsmear models (our internal implementation).
 Main models are provided for comparison:
 - Token-wise MLP regression (fastest local baseline)
 - Token-wise Transformer regression (global token interaction baseline)
-- UNet regression (fast deterministic regression)
 - Flow Matching (conditional vector field + sampling/integration)
 
 Notes:
@@ -15,14 +14,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-
-
-def _mask_conv_features(h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Apply a token mask to `[B,C,L]` features, resizing the mask if needed."""
-    m = mask.to(dtype=h.dtype).unsqueeze(1)
-    if m.size(-1) != h.size(-1):
-        m = nn.functional.interpolate(m, size=h.size(-1), mode="nearest")
-    return h * m
 
 
 class _TokenMLPBlock(nn.Module):
@@ -188,11 +179,6 @@ class TokenMLP(nn.Module):
 #         delta = self.head(h)
 
 #         return (x + delta) if self.return_reco else delta
-
-
-# -----------------------------
-# UNet regression (1D conv over sequence length)
-# -----------------------------
 
 
 class TokenTransformerRegressor(nn.Module):
@@ -437,151 +423,6 @@ class SharedEncoderUnsmearClassifier(nn.Module):
         if return_attention:
             return reco, logits, attn.squeeze(1)
         return reco, logits
-
-
-class _ConvBlock1D(nn.Module):
-    """Conv1D block with LayerNorm over channel dim (via transpose)."""
-
-    def __init__(self, cin: int, cout: int, *, dropout: float):
-        super().__init__()
-        self.conv = nn.Conv1d(int(cin), int(cout), kernel_size=3, padding=1)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(float(dropout))
-        self.norm = nn.LayerNorm(int(cout))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B,C,L]
-        h = self.conv(x)
-        h = self.act(h)
-        h = self.drop(h)
-        # LayerNorm expects [...,C]
-        h = h.transpose(1, 2)
-        h = self.norm(h)
-        h = h.transpose(1, 2)
-        return h
-
-
-class TokenUNet1D(nn.Module):
-    """
-    1D UNet over token sequence length.
-
-    Inputs:
-      x: [B,S,D] (standardized post-smear features)
-      mask: [B,S] (True for valid tokens)
-    Outputs:
-      y_hat: [B,S,D] (prediction; by default returns reconstructed target features)
-    """
-
-    def __init__(
-        self,
-        *,
-        input_dim: int = 7,
-        base_channels: int = 64,
-        depth: int = 3,
-        dropout: float = 0.1,
-        # True: return reconstructed target features (x + delta); False: return residual delta.
-        return_reco: bool = True,
-        # True: also predict log_var (heteroscedastic regression). In this case forward returns (mu, log_var).
-        predict_logvar: bool = False,
-        add_mask_channel: bool = True,
-        mask_output: bool = True,
-        mask_encoder_features: bool = True,
-        w_dr: float = 0.0,
-    ):
-        super().__init__()
-        self.input_dim = int(input_dim)
-        self.return_reco = bool(return_reco)
-        self.predict_logvar = bool(predict_logvar)
-        self.add_mask_channel = bool(add_mask_channel)
-        self.mask_output = bool(mask_output)
-        self.mask_encoder_features = bool(mask_encoder_features)
-
-        cin = self.input_dim + (1 if self.add_mask_channel else 0)
-        chs = [int(base_channels) * (2**i) for i in range(int(depth) + 1)]
-
-        self.in_proj = nn.Conv1d(int(cin), int(chs[0]), kernel_size=1)
-
-        self.down = nn.ModuleList()
-        self.downsample = nn.ModuleList()
-        for i in range(int(depth)):
-            self.down.append(nn.Sequential(_ConvBlock1D(chs[i], chs[i], dropout=float(dropout)),
-                                           _ConvBlock1D(chs[i], chs[i], dropout=float(dropout))))
-            self.downsample.append(nn.Conv1d(chs[i], chs[i + 1], kernel_size=4, stride=2, padding=1))
-
-        self.mid = nn.Sequential(
-            _ConvBlock1D(chs[int(depth)], chs[int(depth)], dropout=float(dropout)),
-            _ConvBlock1D(chs[int(depth)], chs[int(depth)], dropout=float(dropout)),
-        )
-
-        self.up = nn.ModuleList()
-        self.upsample = nn.ModuleList()
-        for i in reversed(range(int(depth))):
-            self.upsample.append(nn.ConvTranspose1d(chs[i + 1], chs[i], kernel_size=4, stride=2, padding=1))
-            self.up.append(nn.Sequential(_ConvBlock1D(chs[i] * 2, chs[i], dropout=float(dropout)),
-                                         _ConvBlock1D(chs[i], chs[i], dropout=float(dropout))))
-
-        out_dim = (2 * self.input_dim) if self.predict_logvar else self.input_dim
-        self.out = nn.Conv1d(chs[0], int(out_dim), kernel_size=1)
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        B, S, D = x.shape
-        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        # [B,D,S]
-        xt = x.transpose(1, 2)
-        if self.add_mask_channel:
-            m = mask.to(dtype=xt.dtype).unsqueeze(1)  # [B,1,S]
-            xt = torch.cat([xt, m], dim=1)
-
-        h = self.in_proj(xt)
-        if self.mask_encoder_features:
-            h = _mask_conv_features(h, mask)
-        skips = []
-        for blk, ds in zip(self.down, self.downsample):
-            h = blk(h)
-            if self.mask_encoder_features:
-                h = _mask_conv_features(h, mask)
-            skips.append(h)
-            h = ds(h)
-            if self.mask_encoder_features:
-                h = _mask_conv_features(h, mask)
-
-        h = self.mid(h)
-        if self.mask_encoder_features:
-            h = _mask_conv_features(h, mask)
-
-        for us, blk in zip(self.upsample, self.up):
-            h = us(h)
-            if self.mask_encoder_features:
-                h = _mask_conv_features(h, mask)
-            # Align sequence length (stride / odd length can cause off-by-one).
-            if skips:
-                s = skips.pop()
-                if h.size(-1) != s.size(-1):
-                    diff = s.size(-1) - h.size(-1)
-                    if diff > 0:
-                        h = nn.functional.pad(h, (0, diff))
-                    elif diff < 0:
-                        h = h[..., : s.size(-1)]
-                h = torch.cat([h, s], dim=1)
-            h = blk(h)
-            if self.mask_encoder_features:
-                h = _mask_conv_features(h, mask)
-
-        out = self.out(h).transpose(1, 2)  # [B,S,?]
-        if self.predict_logvar:
-            delta, log_var = torch.split(out, [self.input_dim, self.input_dim], dim=-1)
-            mu = (x + delta) if self.return_reco else delta
-            if self.mask_output:
-                m = mask.to(dtype=mu.dtype).unsqueeze(-1)
-                mu = mu * m
-                log_var = log_var * m
-            return mu, log_var
-
-        delta = out
-        y = (x + delta) if self.return_reco else delta
-        if self.mask_output:
-            y = y * mask.to(dtype=y.dtype).unsqueeze(-1)
-        return y
 
 
 # -----------------------------

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ResidualBlock(nn.Module):
@@ -131,6 +132,11 @@ class SharedEncoderUnsmearClassifier(nn.Module):
         mask_output: bool = True,
         use_positional_embedding: bool = True,
         max_seq_len: int = 128,
+        cls_use_delta_fusion: bool = True,
+        cls_detach_delta_for_cls: bool = True,
+        cls_gate_hidden_dim: int = 128,
+        cls_gate_init_bias: float = -2.0,
+        cls_alpha_init: float = 0.05,
     ):
         super().__init__()
         self.input_dim = int(input_dim)
@@ -140,6 +146,11 @@ class SharedEncoderUnsmearClassifier(nn.Module):
         self.mask_output = bool(mask_output)
         self.use_positional_embedding = bool(use_positional_embedding)
         self.max_seq_len = int(max_seq_len)
+        self.cls_use_delta_fusion = bool(cls_use_delta_fusion)
+        self.cls_detach_delta_for_cls = bool(cls_detach_delta_for_cls)
+        self.cls_gate_hidden_dim = int(cls_gate_hidden_dim)
+        self.cls_gate_init_bias = float(cls_gate_init_bias)
+        self.cls_alpha_init = float(cls_alpha_init)
         self.unsmear_decoder_layers = int(unsmear_decoder_layers)
         self.unsmear_decoder_heads = int(unsmear_decoder_heads)
         self.unsmear_decoder_ff_dim = int(unsmear_decoder_ff_dim)
@@ -204,6 +215,21 @@ class SharedEncoderUnsmearClassifier(nn.Module):
             self.embed_dim, num_heads=4, dropout=float(dropout), batch_first=True
         )
         self.cls_norm = nn.LayerNorm(self.embed_dim)
+        self.delta_token_proj = nn.Sequential(
+            nn.LayerNorm(self.input_dim),
+            nn.Linear(self.input_dim, self.embed_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+        )
+        self.delta_summary_norm = nn.LayerNorm(self.embed_dim)
+        self.delta_gate = nn.Sequential(
+            nn.Linear(self.embed_dim * 2, self.cls_gate_hidden_dim),
+            nn.LayerNorm(self.cls_gate_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.cls_gate_hidden_dim, self.embed_dim),
+        )
+        self.cls_alpha = nn.Parameter(torch.tensor(float(cls_alpha_init), dtype=torch.float32))
         self.classifier = nn.Sequential(
             nn.Linear(self.embed_dim, 128),
             nn.LayerNorm(128),
@@ -227,6 +253,26 @@ class SharedEncoderUnsmearClassifier(nn.Module):
                     nn.init.zeros_(m.bias)
         if self.pos_embed is not None:
             nn.init.normal_(self.pos_embed.weight, mean=0.0, std=0.02)
+        gate_last = self.delta_gate[-1]
+        if isinstance(gate_last, nn.Linear) and gate_last.bias is not None:
+            nn.init.constant_(gate_last.bias, self.cls_gate_init_bias)
+
+    @staticmethod
+    def _masked_mean_pool(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        m = mask.to(dtype=x.dtype).unsqueeze(-1)
+        num = (x * m).sum(dim=1)
+        den = m.sum(dim=1).clamp_min(1.0)
+        return num / den
+
+    def _build_delta_summary(self, delta: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        delta_for_cls = delta.detach() if self.cls_detach_delta_for_cls else delta
+        delta_tok = self.delta_token_proj(delta_for_cls)
+        delta_tok = delta_tok * mask.to(dtype=delta_tok.dtype).unsqueeze(-1)
+        z_delta = self._masked_mean_pool(delta_tok, mask)
+        return self.delta_summary_norm(z_delta)
+
+    def get_fusion_alpha(self) -> torch.Tensor:
+        return F.softplus(self.cls_alpha)
 
     def encode(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Forward pass through the shared encoder."""
@@ -248,8 +294,15 @@ class SharedEncoderUnsmearClassifier(nn.Module):
         h = self.encoder(h, src_key_padding_mask=~mask)
         return h
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, *, return_attention: bool = False):
-        """Return `(reco, logits)` and optionally the pooling attention weights."""
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        return_attention: bool = False,
+        return_aux: bool = False,
+    ):
+        """Return `(reco, logits)` and optionally pooling attention / fusion diagnostics."""
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         h = self.encode(x, mask)
 
@@ -263,17 +316,51 @@ class SharedEncoderUnsmearClassifier(nn.Module):
         )
         dec_out = dec_out * mask.to(dtype=dec_out.dtype).unsqueeze(-1)
         delta = self.unsmear_head(dec_out)
+        if self.mask_output:
+            delta = delta * mask.to(dtype=delta.dtype).unsqueeze(-1)
         reco = (x + delta) if self.return_reco else delta
         if self.mask_output:
             reco = reco * mask.to(dtype=reco.dtype).unsqueeze(-1)
 
         q = self.pool_query.expand(x.shape[0], -1, -1)
         pooled, attn = self.pool_attn(
-            q, h, h, key_padding_mask=~mask, need_weights=True, average_attn_weights=True
+            q,
+            h,
+            h,
+            key_padding_mask=~mask,
+            need_weights=bool(return_attention),
+            average_attn_weights=True,
         )
-        z = self.cls_norm(pooled.squeeze(1))
-        logits = self.classifier(z)
+        z_main = self.cls_norm(pooled.squeeze(1))
+        z_delta = torch.zeros_like(z_main)
+        gate = torch.zeros_like(z_main)
+        z_final = z_main
+        if self.cls_use_delta_fusion:
+            z_delta = self._build_delta_summary(delta, mask)
+            gate_in = torch.cat([z_main, z_delta], dim=-1)
+            gate = torch.sigmoid(self.delta_gate(gate_in))
+            alpha = self.get_fusion_alpha().to(dtype=z_main.dtype)
+            z_final = z_main + alpha * gate * z_delta
+        else:
+            alpha = self.get_fusion_alpha().to(dtype=z_main.dtype)
 
+        logits = self.classifier(z_final)
+        aux = {
+            "z_main": z_main,
+            "z_delta": z_delta,
+            "z_final": z_final,
+            "gate": gate,
+            "gate_mean": gate.mean(),
+            "gate_std": gate.std(unbiased=False),
+            "alpha": alpha,
+            "fusion_enabled": bool(self.cls_use_delta_fusion),
+            "delta_detached_for_cls": bool(self.cls_detach_delta_for_cls),
+        }
+
+        if return_attention and return_aux:
+            return reco, logits, attn.squeeze(1), aux
         if return_attention:
             return reco, logits, attn.squeeze(1)
+        if return_aux:
+            return reco, logits, aux
         return reco, logits

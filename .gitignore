@@ -14,3 +14,6 @@ Thumbs.db
 
 # data
 test.h5
+
+# tmp files
+.tmp*/
