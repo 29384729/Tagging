@@ -8,12 +8,9 @@ __pycache__/
 # Local experiment outputs
 runs*/
 
-# OS/editor
-.DS_Store
-Thumbs.db
-
 # data
 test.h5
 
 # tmp files
 .tmp*/
+

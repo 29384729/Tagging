@@ -12,7 +12,7 @@ import numpy as np
 
 @dataclass
 class CommonSmearCfg:
-    """常用的 constituent smear 配置。"""
+    """Track constituent merge groups and parent/child indices."""
 
     pt_threshold_offline: float = 0.5
     pt_threshold_hlt: float = 0.5
@@ -22,7 +22,7 @@ class CommonSmearCfg:
 
 
 def wrap_dphi_np(dphi: np.ndarray) -> np.ndarray:
-    """将角度差 wrap 到 (-pi, pi]。"""
+    """Wrap azimuthal differences to [-pi, pi]."""
     return np.arctan2(np.sin(dphi), np.cos(dphi))
 
 
@@ -32,7 +32,7 @@ def _print_distribution_stats(
     *,
     percentiles: Sequence[float],
 ) -> None:
-    """打印一维数组的基础统计信息。"""
+    """Print summary statistics for a masked distribution."""
     print(f"\n[{name}] used_values={int(values.size):,}")
     if values.size == 0:
         print("No values after masking.")
@@ -60,7 +60,7 @@ def inspect_dist_h5(
     transform: str | None = None,
     percentiles: Sequence[float] = (0.1, 1, 5, 25, 50, 75, 95, 99, 99.9),
 ) -> np.ndarray:
-    """检查 H5 数据集的一维分布。"""
+    """Inspect the one-dimensional distribution of an H5 dataset."""
     ds = h5_file[key]
     n_sel = int(min(max(1, n_jets), int(ds.shape[0])))
 
@@ -114,7 +114,7 @@ def _load_constituent_arrays(
     n_jets: int,
     max_particles: int | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """读取前 N 个 jet 的 constituent 四个物理量，并构建有效 mask。"""
+    """Track constituent merge groups and parent/child indices."""
     pt_ds = h5_file["fjet_clus_pt"]
     eta_ds = h5_file["fjet_clus_eta"]
     phi_ds = h5_file["fjet_clus_phi"]
@@ -142,7 +142,7 @@ def _apply_constituent_smear(
     cfg: CommonSmearCfg,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """对 constituent 四动量施加常用 smear 效果。"""
+    """Track constituent merge groups and parent/child indices."""
     rs = np.random.RandomState(int(seed))
 
     pt_out = np.asarray(pt, dtype=np.float64).copy()
@@ -187,7 +187,7 @@ def _apply_constituent_thresholds(
     *,
     cfg: CommonSmearCfg,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """只施加常用 threshold，不施加 smear。"""
+    """Prefix and threshold inference diagnostics."""
     pt_out = np.asarray(pt, dtype=np.float64).copy()
     eta_out = np.asarray(eta, dtype=np.float64).copy()
     phi_out = np.asarray(phi, dtype=np.float64).copy()
@@ -212,7 +212,7 @@ def build_smeared_jet_frame_feature_map(
     cfg: Optional[CommonSmearCfg] = None,
     seed: int = 42,
 ) -> dict[str, np.ndarray]:
-    """对前 N 个 jet 做 smear 后，再构造 jet-axis 坐标系下的特征。"""
+    """Build jet-frame dEta and dPhi arrays after HLT smearing."""
     cfg = CommonSmearCfg() if cfg is None else cfg
     pt, eta, phi, energy, mask = _load_constituent_arrays(
         h5_file,
@@ -253,7 +253,7 @@ def build_jet_frame_feature_map(
     n_jets: int = 20000,
     max_particles: int | None = None,
 ) -> dict[str, np.ndarray]:
-    """仅用 constituent 的 pt/eta/phi/E 构造 jet-axis 坐标系下的特征。"""
+    """Track constituent merge groups and parent/child indices."""
     pt, eta, phi, energy, mask = _load_constituent_arrays(
         h5_file,
         n_jets=n_jets,
@@ -293,7 +293,7 @@ def inspect_jet_frame_constituent_distributions(
     logy: bool = False,
     percentiles: Sequence[float] = (0.1, 1, 5, 25, 50, 75, 95, 99, 99.9),
 ) -> dict[str, np.ndarray]:
-    """检查 jet-axis 坐标系下 constituent 特征的分布。"""
+    """Track constituent merge groups and parent/child indices."""
     feature_map = build_jet_frame_feature_map(
         h5_file,
         n_jets=n_jets,
@@ -328,7 +328,7 @@ def inspect_standardized_jet_frame_constituent_distributions(
     logy: bool = False,
     percentiles: Sequence[float] = (0.1, 1, 5, 25, 50, 75, 95, 99, 99.9),
 ) -> dict[str, dict[str, np.ndarray] | dict[str, float]]:
-    """检查 jet-axis 后再做 mean/std 标准化的四维特征分布。"""
+    """Inspect feature distributions after jet-axis conversion and mean/std standardization."""
     feature_map = build_jet_frame_feature_map(
         h5_file,
         n_jets=n_jets,
@@ -373,7 +373,7 @@ def get_single_jet_constituents(
     jet_idx: int,
     max_particles: int | None = None,
 ) -> dict[str, np.ndarray]:
-    """读取单个 jet 的有效 constituent 四动量信息。"""
+    """Track constituent merge groups and parent/child indices."""
     pt_ds = h5_file["fjet_clus_pt"]
     s = int(min(int(pt_ds.shape[1]), max_particles)) if max_particles is not None else int(pt_ds.shape[1])
 
@@ -403,7 +403,7 @@ def _single_jet_axis_features(
     eta: np.ndarray,
     phi: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, float, float]:
-    """基于单个 jet 的 constituent 计算 jet-axis 下的 dEta/dPhi。"""
+    """Track constituent merge groups and parent/child indices."""
     px = pt * np.cos(phi)
     py = pt * np.sin(phi)
     pz = pt * np.sinh(eta)
@@ -424,7 +424,7 @@ def get_jet_frame_standardization_stats(
     n_jets: int = 20000,
     max_particles: int | None = None,
 ) -> dict[str, float]:
-    """用前 N 个 jet 的 jet-frame dEta/dPhi 统计标准化参数。"""
+    """Compute jet-frame standardization statistics from raw constituents."""
     feature_map = build_jet_frame_feature_map(
         h5_file,
         n_jets=n_jets,
@@ -452,7 +452,7 @@ def get_smeared_jet_frame_standardization_stats(
     cfg: Optional[CommonSmearCfg] = None,
     seed: int = 42,
 ) -> dict[str, float]:
-    """用 smear 后前 N 个 jet 的 jet-frame dEta/dPhi 统计标准化参数。"""
+    """Compute jet-frame standardization statistics after HLT smearing."""
     feature_map = build_smeared_jet_frame_feature_map(
         h5_file,
         n_jets=n_jets,
@@ -481,7 +481,7 @@ def get_thresholded_jet_frame_standardization_stats(
     max_particles: int | None = None,
     cfg: Optional[CommonSmearCfg] = None,
 ) -> dict[str, float]:
-    """用 threshold 后前 N 个 jet 的 jet-frame dEta/dPhi 统计标准化参数。"""
+    """Prefix and threshold inference diagnostics."""
     cfg = CommonSmearCfg() if cfg is None else cfg
     pt, eta, phi, energy, mask = _load_constituent_arrays(
         h5_file,
@@ -530,7 +530,7 @@ def plot_single_jet_constituent_views(
     # rng_seed: int = 42,
     color_by: Sequence[str] = ("pt",),
 ) -> int:
-    """画单个 jet 的 E-p 散点图和 jet-axis 平面图。"""
+    """Plot constituent views for one selected jet."""
     if jet_idx is None:
         # rng = np.random.default_rng(int(rng_seed))
         jet_idx = np.random.randint(0, int(h5_file["fjet_clus_pt"].shape[0]))
@@ -611,7 +611,7 @@ def plot_single_jet_standardized_jet_frame(
     stats_max_particles: int | None = None,
     color_by: str = "pt",
 ) -> int:
-    """画单个 jet 在标准化后的 jet-axis 坐标系中的 dEta/dPhi 散点图。"""
+    """Plot one jet in standardized jet-frame coordinates."""
     if jet_idx is None:
         jet_idx = int(np.random.randint(0, int(h5_file["fjet_clus_pt"].shape[0])))
 
@@ -691,7 +691,7 @@ def plot_single_jet_smeared_coordinate_views(
     cfg: Optional[CommonSmearCfg] = None,
     seed: int = 42,
 ) -> int:
-    """画单个 jet 在 smear 后的 raw / jet-axis / standardized 三联图。"""
+    """Convert values between standardized and original feature space."""
     cfg = CommonSmearCfg() if cfg is None else cfg
     if jet_idx is None:
         jet_idx = int(np.random.randint(0, int(h5_file["fjet_clus_pt"].shape[0])))
@@ -798,7 +798,7 @@ def plot_single_jet_smeared_std_comparison(
     seed: int = 42,
     cmap: str = "turbo",
 ) -> int:
-    """在同一张 std 空间图中展示 smear 前后的对应位移。"""
+    """Convert values between standardized and original feature space."""
     cfg = CommonSmearCfg() if cfg is None else cfg
     if jet_idx is None:
         jet_idx = int(np.random.randint(0, int(h5_file["fjet_clus_pt"].shape[0])))
